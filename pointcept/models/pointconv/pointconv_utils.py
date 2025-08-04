@@ -1,0 +1,317 @@
+import torch
+from torch.nn import functional as F
+import warnings
+
+
+# CheckpointFunction class taken from https://github.com/csrhddlam/pytorch-checkpoint/blob/master/checkpoint.py
+# copyright (c) 2018 Huiyu Wang
+# MIT License: https://github.com/csrhddlam/pytorch-checkpoint/blob/master/LICENSE
+
+def detach_variable(inputs):
+    if isinstance(inputs, tuple):
+        out = []
+        for inp in inputs:
+            x = inp.detach()
+            x.requires_grad = inp.requires_grad
+            out.append(x)
+        return tuple(out)
+    else:
+        raise RuntimeError(
+            "Only tuple of tensors is supported. Got Unsupported input type: ", type(inputs).__name__)
+
+
+def check_backward_validity(inputs):
+    if not any(inp.requires_grad for inp in inputs):
+        warnings.warn("None of the inputs have requires_grad=True. Gradients will be None")
+
+
+# Forward:
+# Performs the forward pass of a fused Point Convolution (PConv) + Linear layer using CUTLASS GEMMs.
+# Gathers neighbor features, applies batched GEMM for PConv,
+# then projects the result through a linear layer with optional batching for large inputs.
+#
+# Backward:
+# Computes gradients for a fused Point Convolution (PConv) + Linear layer using two CUDA kernels.
+# One handles output-point gradients including PConv and linear layers,
+# while the other covers input-only points to avoid divergence.
+# Uses precomputed reverse indices to ensure full and optimized gradient coverage.
+class PConvLinearOptFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_feat, neighbor_inds, inverse_neighbors, inverse_k, inverse_idx,
+                        weightnet, additional_features, linear_weights, linear_bias):
+        neighbor_inds.requires_grad = False
+
+        output, pconv_output = pcf_cuda.pconv_linear_cutlass_forward(
+            input_feat, neighbor_inds, weightnet, additional_features, 
+            linear_weights, linear_bias)
+
+        ctx.save_for_backward(input_feat, inverse_neighbors, inverse_k, inverse_idx, 
+                            neighbor_inds, weightnet, additional_features, 
+                            linear_weights, pconv_output)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        saved = ctx.saved_tensors
+        input_feat, inverse_neighbors, inverse_k, inverse_idx, neighbor_inds, \
+        weightnet, additional_features, linear_weights, pconv_output = saved
+
+        grad_output = grad_output.contiguous()
+
+        grads = pcf_cuda.pconv_linear_opt_backward(
+            grad_output, input_feat, inverse_neighbors, inverse_k, 
+            inverse_idx, neighbor_inds, weightnet, additional_features,
+            linear_weights, pconv_output)
+
+        return grads[0], None, None, None, None, grads[1], grads[2], grads[3], grads[4]
+
+# Wrapper for PConvLinearOptFunction
+class PConvLinearOpt(torch.nn.Module):
+    """
+    Optimized PConv + Linear fused layer
+    """
+    def __init__(self, in_features, out_features):
+        super(PConvLinearOpt, self).__init__()
+        self.linear = torch.nn.Linear(in_features, out_features)
+
+    def forward(self, input_features, neighbor_inds, inverse_neighbors, inverse_k, inverse_idx, weightnet, additional_features=None):
+        if additional_features is None:
+            additional_features = torch.zeros(input_features.shape[0], input_features.shape[1], 
+                                          neighbor_inds.shape[2], 0, device=input_features.device)
+        return PConvLinearOptFunction.apply(input_features, neighbor_inds, inverse_neighbors, inverse_k, inverse_idx,
+                                                weightnet, additional_features, self.linear.weight, self.linear.bias)
+
+def _bn_function_factory(mlp_convs):
+    # Used for the gradient checkpointing in WeightNet
+    def bn_function(*inputs):
+        output = inputs[0]
+        for conv in mlp_convs:
+            output = F.relu(conv(output), inplace=True)
+        return output
+    return bn_function
+
+
+
+class CheckpointFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, run_function, length, *args):
+        ctx.run_function = run_function
+        ctx.input_tensors = list(args[:length])
+        ctx.input_params = list(args[length:])
+        with torch.no_grad():
+            output_tensors = ctx.run_function(*ctx.input_tensors)
+        return output_tensors
+
+    @staticmethod
+    def backward(ctx, *output_grads):
+        for i in range(len(ctx.input_tensors)):
+            temp = ctx.input_tensors[i]
+            ctx.input_tensors[i] = temp.detach()
+            ctx.input_tensors[i].requires_grad = temp.requires_grad
+        with torch.enable_grad():
+            output_tensors = ctx.run_function(*ctx.input_tensors)
+        input_grads = torch.autograd.grad(output_tensors, ctx.input_tensors + ctx.input_params, output_grads, allow_unused=True)
+        return (None, None) + input_grads
+
+# cp_batchnorm.py taken from https://github.com/csrhddlam/pytorch-checkpoint/blob/master/
+# copyright (c) 2018 Huiyu Wang
+# MIT License: https://github.com/csrhddlam/pytorch-checkpoint/blob/master/LICENSE
+class CpBatchNorm2d(torch.nn.BatchNorm2d):
+    def __init__(self, *args, **kwargs):
+        super(CpBatchNorm2d, self).__init__(*args, **kwargs)
+
+    def forward(self, input):
+        self._check_input_dim(input)
+        if self.training:
+            exponential_average_factor = 0.0
+            if self.training and self.track_running_stats:
+                self.num_batches_tracked += 1
+                if self.momentum is None:  # use cumulative moving average
+                    exponential_average_factor = 1.0 / self.num_batches_tracked.item()
+                else:  # use exponential moving average
+                    exponential_average_factor = self.momentum
+            return F.batch_norm(
+                input, self.running_mean, self.running_var, self.weight, self.bias,
+                self.training or not self.track_running_stats,
+                exponential_average_factor, self.eps)
+        else:
+            return F.batch_norm(
+                input, self.running_mean, self.running_var, self.weight, self.bias,
+                self.training or not self.track_running_stats, 0.0, self.eps)
+
+def index_points(points, idx):
+    """
+    Input:
+        points: input points data, shape [B, N, C]
+        idx: sample index data, shape [B, S] / [B, S, K]
+    Return:
+        new_points:, indexed points data, shape [B, S, C] / [B, S, K, C]
+    """
+    device = points.device
+    B = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long).to(
+        device).view(view_shape).repeat(repeat_shape)
+    new_points = points[batch_indices, idx, :]
+    return new_points
+
+def VI_coordinate_transform(localized_xyz, gathered_norm, sparse_xyz_norm, K):
+    """
+    Compute the viewpoint-invariance aware relative position encoding in VI_PointConv
+    From: X. Li et al. Improving the Robustness of Point Convolution on k-Nearest Neighbor Neighborhoods with a Viewpoint-Invariant Coordinate Transform. WACV 2023
+    Code copyright 2020 Xingyi Li (MIT License)
+    Input:
+        dense_xyz: 3D coordinates (note VI only works on 3D)
+        nei_inds: indices of neighborhood points for each point
+        dense_xyz_norm: surface normals for each point
+        sparse_xyz_norm: surface normals for each point in the lower resolution (normally
+                the same as dense_xyz_norm, except when downsampling)
+    Return:
+        VI-transformed point coordinates: a concatenation of rotation+scale invariant dimensions, scale-invariant dimensions and non-invariant dimensions
+    """
+    r_hat = F.normalize(localized_xyz, dim=3)
+    v_miu = sparse_xyz_norm.unsqueeze(
+        dim=2) - torch.matmul(
+        sparse_xyz_norm.unsqueeze(
+            dim=2), r_hat.permute(
+                0, 1, 3, 2)).permute(
+                    0, 1, 3, 2) * r_hat
+    v_miu = F.normalize(v_miu, dim=3)
+    w_miu = torch.cross(r_hat, v_miu, dim=3)
+    w_miu = F.normalize(w_miu, dim=3)
+    theta1 = torch.matmul(gathered_norm, sparse_xyz_norm.unsqueeze(dim=3))
+    theta2 = torch.matmul(r_hat, sparse_xyz_norm.unsqueeze(dim=3))
+    theta3 = torch.sum(r_hat * gathered_norm, dim=3, keepdim=True)
+    theta4 = torch.matmul(localized_xyz, sparse_xyz_norm.unsqueeze(dim=3))
+    theta5 = torch.sum(gathered_norm * r_hat, dim=3, keepdim=True)
+    theta6 = torch.sum(gathered_norm * v_miu, dim=3, keepdim=True)
+    theta7 = torch.sum(gathered_norm * w_miu, dim=3, keepdim=True)
+    theta8 = torch.sum(
+        localized_xyz *
+        torch.cross(
+            gathered_norm,
+            sparse_xyz_norm.unsqueeze(
+                dim=2).repeat(
+                1,
+                1,
+                K,
+                1),
+            dim=3),
+        dim=3,
+        keepdim=True)
+    theta9 = torch.norm(localized_xyz, dim=3, keepdim=True)
+    return torch.cat([theta1,
+                      theta2,
+                      theta3,
+                      theta4,
+                      theta5,
+                      theta6,
+                      theta7,
+                      theta8,
+                      theta9,
+                      localized_xyz],
+                     dim=3).contiguous()
+
+class PermutedBN(nn.Module):
+    '''
+    Permuted Batch Normalization layer
+    '''
+    def __init__(self, out_dim, momentum=0.1):
+        super(PermutedBN, self).__init__()
+        self.bn = torch.nn.BatchNorm1d(out_dim, momentum=momentum)
+
+    def forward(self, x):
+        return self.bn(x.permute(0, 2, 1)).permute(0, 2, 1)
+
+# We did not like that the pyTorch batch normalization requires C to be the 2nd dimension of the Tensor
+# It's hard to deal with it during training time, but we can fuse it during inference time
+# This one takes in a 4D tensor of shape BNKC, run a linear layer and a BN layer, and then fuses it during inference time
+# Output is BNKC as well
+# B is batch size, N is number of points, K is number of neighbors
+# one would need to call the fuse function during inference time (see
+# utils.replace_bn_layers)
+class Linear_BN(torch.nn.Module):
+    def __init__(
+            self,
+            in_dim,
+            out_dim,
+            bn_ver='2d',
+            bn_weight_init=1,
+            bn_momentum=0.1):
+        super().__init__()
+        self.c = torch.nn.Linear(in_dim, out_dim)
+        self.bn_ver = bn_ver
+        if bn_ver == '2d':
+            bn = CpBatchNorm2d(out_dim, momentum=bn_momentum)
+        else:
+            bn = torch.nn.BatchNorm1d(out_dim, momentum=bn_momentum)
+        torch.nn.init.constant_(bn.weight, bn_weight_init)
+#        torch.nn.init.constant_(bn.bias, 0)
+        self.bn = bn
+
+    @torch.no_grad()
+    @torch.jit.ignore()
+    def fuse(self):
+        w = self.bn.weight / (self.bn.running_var + self.bn.eps) ** 0.5
+        w = self.c.weight * w[:, None]
+        b = self.bn.bias + (self.c.bias - self.bn.running_mean) * self.bn.weight / \
+            (self.bn.running_var + self.bn.eps)**0.5
+        new_layer = torch.nn.Linear(w.size(1), w.size(0))
+        new_layer.weight.data.copy_(w)
+        new_layer.bias.data.copy_(b)
+        return new_layer
+
+    def forward(self, x):
+        x = self.c(x)
+        if self.bn_ver == '2d':
+            return self.bn(x.permute(0, 3, 2, 1)).permute(0, 3, 2, 1)
+        else:
+            return self.bn(x.permute(0, 2, 1)).permute(0, 2, 1)
+
+# Linear_BN + Leaky ReLU activation
+class UnaryBlock(nn.Module):
+    def __init__(self, in_dim, out_dim, norm_layer, bn_momentum = 0.1, no_relu=False):
+        """
+        Initialize a standard unary block with its ReLU and BatchNorm.
+        :param in_dim: dimension input features
+        :param out_dim: dimension input features
+        :param norm_layer: 'bn' for BatchNorm, or a function pointer for custom normalization
+        :param bn_momentum: Batch norm momentum, default is 0.1
+        :param no_relu: if True, do not apply Leaky ReLU activation
+        """
+
+        super(UnaryBlock, self).__init__()
+        self.bn_momentum = bn_momentum
+        self.use_bn = use_bn
+        self.no_relu = no_relu
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        if norm_layer == 'bn':
+            self.mlp = Linear_BN(
+                in_dim,
+                out_dim,
+                bn_momentum=bn_momentum,
+                bn_ver='1d')
+        else:
+            self.mlp = nn.Linear(in_dim, out_dim)
+        if not no_relu:
+            self.leaky_relu = nn.LeakyReLU(0.1)
+        else:
+            self.leaky_relu = nn.Identity()
+        return
+
+    def forward(self, x):
+        x = self.mlp(x)
+        # BN case is already handled in Linear_BN
+        if callable(norm_layer):
+            x = norm_layer(x)
+        if not self.no_relu:
+            x = self.leaky_relu(x)
+        return x
+
+    def __repr__(self):
+        return 'UnaryBlock(in_feat: {:d}, out_feat: {:d}, BN: {:s}, ReLU: {:s})'.format(
+            self.in_dim, self.out_dim, str(self.use_bn), str(not self.no_relu))
