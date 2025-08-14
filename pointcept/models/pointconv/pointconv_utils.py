@@ -86,7 +86,7 @@ def _bn_function_factory(mlp_convs):
     def bn_function(*inputs):
         output = inputs[0]
         for conv in mlp_convs:
-            output = F.relu(conv(output), inplace=True)
+            output = conv(output)
         return output
     return bn_function
 
@@ -271,47 +271,3 @@ class Linear_BN(torch.nn.Module):
         else:
             return self.bn(x.permute(0, 2, 1)).permute(0, 2, 1)
 
-# Linear_BN + Leaky ReLU activation
-class UnaryBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, norm_layer, bn_momentum = 0.1, no_relu=False):
-        """
-        Initialize a standard unary block with its ReLU and BatchNorm.
-        :param in_dim: dimension input features
-        :param out_dim: dimension input features
-        :param norm_layer: 'bn' for BatchNorm, or a function pointer for custom normalization
-        :param bn_momentum: Batch norm momentum, default is 0.1
-        :param no_relu: if True, do not apply Leaky ReLU activation
-        """
-
-        super(UnaryBlock, self).__init__()
-        self.bn_momentum = bn_momentum
-        self.use_bn = use_bn
-        self.no_relu = no_relu
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        if norm_layer == 'bn':
-            self.mlp = Linear_BN(
-                in_dim,
-                out_dim,
-                bn_momentum=bn_momentum,
-                bn_ver='1d')
-        else:
-            self.mlp = nn.Linear(in_dim, out_dim)
-        if not no_relu:
-            self.leaky_relu = nn.LeakyReLU(0.1)
-        else:
-            self.leaky_relu = nn.Identity()
-        return
-
-    def forward(self, x):
-        x = self.mlp(x)
-        # BN case is already handled in Linear_BN
-        if callable(norm_layer):
-            x = norm_layer(x)
-        if not self.no_relu:
-            x = self.leaky_relu(x)
-        return x
-
-    def __repr__(self):
-        return 'UnaryBlock(in_feat: {:d}, out_feat: {:d}, BN: {:s}, ReLU: {:s})'.format(
-            self.in_dim, self.out_dim, str(self.use_bn), str(not self.no_relu))

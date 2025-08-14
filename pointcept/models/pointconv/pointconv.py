@@ -1,4 +1,3 @@
-from pointcept.models.utils.structure import Point
 from timm.layers import DropPath
 
 
@@ -10,6 +9,30 @@ from pointconv_utils import PConvLinearOpt, index_points, VI_coordinate_transfor
 # Treatments to deal with batch normalization and gradient checkpointing for batch normalization
 # Can be removed if not using batch normalization
 from pointconv_utils import CheckpointFunction,CpBatchNorm2d,Linear_BN,PermutedBN,_bn_function_factory
+
+
+class PointLinearLayer(nn.Module):
+    """
+    A simple linear layer for point clouds with fused batch normalization if bn is chosen as the normalization layer and optional activation layer
+    """
+    def __init__(self, in_channels, out_channels, norm_layer=None, act_layer=None):
+        super(PointLinearLayer, self).__init__()
+        self.act_layer = act_layer
+        self.norm_layer = norm_layer
+        if norm_layer == 'bn':
+            self.linear = Linear_BN(in_channels, out_channels, bn_ver='1d')
+        else:
+            if not callable(norm_layer):
+                raise AssertionError("norm_layer must be 'bn' or a function pointer")
+            self.linear = nn.Linear(in_channels, out_channels)
+
+    def forward(self, x):
+        x = self.linear(x)
+        if callable(self.norm_layer):
+            x = self.norm_layer(x)
+        if callable(self.act_layer):
+            x = self.act_layer(x)
+        return x
 
 # Using nn.Module right now for using pointconv layers as standalone modules
 # PointModule doesn't seem to be different from nn.Module
@@ -39,6 +62,7 @@ class WeightNet(nn.Module):
             out_channel,
             hidden_unit=[8, 8],
             norm_layer = 'bn',
+            act_layer = F.relu(inplace=True),
             efficient=False):
         super(WeightNet, self).__init__()
 
@@ -46,41 +70,23 @@ class WeightNet(nn.Module):
         self.efficient = efficient
         if norm_layer == 'bn':
             self.bn = True
-            if hidden_unit is None or len(hidden_unit) == 0:
-                self.mlp_convs.append(Linear_BN(in_channel, out_channel))
-            else:
-                self.mlp_convs.append(Linear_BN(in_channel, hidden_unit[0]))
-                for i in range(1, len(hidden_unit)):
-                    self.mlp_convs.append(
-                        Linear_BN(hidden_unit[i - 1], hidden_unit[i]))
-                self.mlp_convs.append(Linear_BN(hidden_unit[-1], out_channel))
         else:
             self.bn = False
-            if not callable(norm_layer):
-                raise AssertionError("norm_layer must be 'bn' or a function pointer")
-            if hidden_unit is None or len(hidden_unit) == 0:
-                self.mlp_convs.append(torch.nn.Linear(in_channel, out_channel))
-                self.mlp_convs.append(norm_layer)
-            else:
-                self.mlp_convs.append(torch.nn.Linear(in_channel, hidden_unit[0]))
-                self.mlp_convs.append(norm_layer)
-                for i in range(1, len(hidden_unit)):
-                    self.mlp_convs.append(
-                        torch.nn.Linear(hidden_unit[i - 1], hidden_unit[i]))
-                    self.mlp_convs.append(norm_layer)
+        if hidden_unit is None or len(hidden_unit) == 0:
+            self.mlp_convs.append(PointLinearLayer(in_channel, out_channel))
+        else:
+            self.mlp_convs.append(PointLinearLayer(in_channel, hidden_unit[0], norm_layer=norm_layer, act_layer=act_layer))
+            for i in range(1, len(hidden_unit)):
+                self.mlp_convs.append(
+                    PointLinearLayer(hidden_unit[i - 1], hidden_unit[i], norm_layer=norm_layer))
                 # TODO: Copilot suggested to remove the last norm layer, maybe try it at some point
-                self.mlp_convs.append(torch.nn.Linear(hidden_unit[-1], out_channel))
-                self.mlp_convs.append(norm_layer)
-
+            self.mlp_convs.append(PointLinearLayer(hidden_unit[-1], out_channel, norm_layer=norm_layer,act_layer = act_layer))
 
     def real_forward(self, localized_xyz):
         # xyz : BxNxKxC
         weights = localized_xyz
         for conv in self.mlp_convs:
             weights = conv(weights)
-#        if i < len(self.mlp_convs) - 1:
-#        NOTE: tried and doesn't seem to make any difference, likely because of the subsequent linear layer
-            weights = F.relu(weights, inplace=True)
 
         return weights
 
@@ -102,10 +108,10 @@ class WeightNet(nn.Module):
             args = [localized_xyz + dummy]
             if self.training:
                 for conv in self.mlp_convs:
-                    args += tuple(conv.bn.parameters())
-                    args += tuple(conv.c.parameters())
+                    args += tuple(conv.linear.bn.parameters())
+                    args += tuple(conv.linear.c.parameters())
                 weights = CheckpointFunction.apply(conv_bn_relu, 1, *args)
-        else if self.efficient and self.training:
+        elif self.efficient and self.training:
             # Use gradient checkpointing for memory efficiency. WeightNet can be
             # very inefficient during training if checkpointing is not used
             weights = checkpoint.checkpoint(self.real_forward, localized_xyz)
@@ -113,7 +119,7 @@ class WeightNet(nn.Module):
             weights = self.real_forward(localized_xyz)
         return weights
 
-class PointConvPE(nn.Module):
+class PointConvResBlock(nn.Module):
     '''
     PointConv block with a positional embedding concatenated to the features
     and a ResNet-style bottleneck structure and shortcut connections
@@ -142,9 +148,10 @@ class PointConvPE(nn.Module):
                  USE_CUDA_KERNEL = True,
                  weightnet=[9, 16], 
                  norm_layer = 'bn',
+                 act_layer = F.leaky_relu(0.1,inplace=True),
                  drop_out_rate = 0.0, 
                  drop_path_rate=0.0):
-        super(PointConvPE, self).__init__()
+        super(PointConvResBlock, self).__init__()
         self.in_channel = in_channel
         self.out_channel = out_channel
         self.USE_CUDA_KERNEL = USE_CUDA_KERNEL
@@ -152,10 +159,11 @@ class PointConvPE(nn.Module):
 
         self.drop_path = DropPath(
             drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+        self.act_layer = act_layer
 
         # positonal encoder
         self.pe_convs = WeightNet(
-            3, min(out_channel // 4, 32), hidden_unit=[out_channel // 4], norm_layer = norm_layer, efficient=True)
+            3, min(out_channel // 4, 32), hidden_unit=[out_channel // 4], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
         last_ch = min(out_channel // 4, 32)
 
         # First downscaling mlp
@@ -167,42 +175,27 @@ class PointConvPE(nn.Module):
         else:
             self.unary1 = nn.Identity()
 
-        self.weightnet = WeightNet(weightnet[0], weightnet[1], norm_layer = norm_layer, efficient=True)
+        self.weightnet = WeightNet(weightnet[0], weightnet[1], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
         if self.USE_CUDA_KERNEL:
             self.pconv_linear_opt = PConvLinearOpt((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2)
             # need to customly do BN without the fusion as of this CUDA kernel
             if self.norm_layer == 'bn':
                 self.norm_layer = PermutedBN(out_channel // 2, momentum=0.1)
         else: 
-            if self.norm_layer == 'bn':
-                self.linear = Linear_BN(
-                    (out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2, bn_ver='1d')
-            else:
-                self.linear = nn.Linear(
-                    (out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2)
+            # we would have to do normalization separately because the CUDA kernel doesn't have normalization built in it
+            self.linear = PointLinearLayer((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2, norm_layer=None, act_layer=None)
 
         self.dropout = nn.Dropout(
-            p=dropout_rate) if dropout_rate > 0. else nn.Identity()
+            p=drop_out_rate) if drop_out_rate > 0. else nn.Identity()
 
         # Second upscaling mlp
-        self.unary2 = UnaryBlock(
-            out_channel // 2,
-            out_channel,
-            norm_layer = norm_layer,
-            no_relu=True)
+        self.unary2 = PointLinearLayer(out_channel // 2, out_channel, norm_layer = norm_layer, act_layer = None)
 
         # Shortcut optional mlp
         if in_channel != out_channel:
-            self.unary_shortcut = UnaryBlock(
-                in_channel,
-                out_channel,
-                norm_layer = norm_layer,
-                no_relu=True)
+            self.unary_shortcut = PointLinearLayer(in_channel,out_channel,norm_layer = norm_layer, act_layer = None)
         else:
             self.unary_shortcut = nn.Identity()
-
-        # Other operations
-        self.leaky_relu = nn.LeakyReLU(0.1)
 
         return
 
@@ -211,7 +204,7 @@ class PointConvPE(nn.Module):
             dense_xyz,
             dense_feats,
             nei_inds,
-            dense_xyz_norm,
+            dense_xyz_norm=None,
             sparse_xyz=None,
             sparse_xyz_norm=None,
             vi_features=None,
@@ -247,11 +240,14 @@ class PointConvPE(nn.Module):
             localized_xyz = gathered_xyz - sparse_xyz.unsqueeze(dim=2)
         else:
             localized_xyz = gathered_xyz - dense_xyz.unsqueeze(dim=2)
-        gathered_norm = index_points(dense_xyz_norm, nei_inds)
 
         feat_pe = self.pe_convs(localized_xyz)  # [B, M, K, D]
 
         if self.USE_VI is True:
+            if dense_xyz_norm is None:
+                raise AssertionError(
+                    "dense_xyz_norm must be provided for VI features")
+            gathered_norm = index_points(dense_xyz_norm, nei_inds)
             if vi_features is None:
                 if sparse_xyz is not None:
                     weightNetInput = VI_coordinate_transform(
@@ -285,14 +281,14 @@ class PointConvPE(nn.Module):
                     0, 1, 3, 2), other=weights).view(
                 B, M, -1)
         # In the fused CUDA kernel, we have already done the linear layer
-        if not self.cfg.USE_CUDA_KERNEL:
+        if not self.USE_CUDA_KERNEL:
             new_feat = self.linear(new_feat)
         if callable(self.norm_layer):
             new_feat = self.norm_layer(new_feat)
-        new_feat = F.relu(new_feat, inplace=True)
 
         # Dropout
         new_feat = self.dropout(new_feat)
+        new_feat = self.act_layer(new_feat)
 
         # Second upscaling mlp
         new_feat = self.unary2(new_feat)
@@ -307,7 +303,7 @@ class PointConvPE(nn.Module):
 
         shortcut = self.unary_shortcut(sparse_feats)
 
-        new_feat = self.leaky_relu(self.drop_path(new_feat) + shortcut)
+        new_feat = self.act_layer(self.drop_path(new_feat) + shortcut)
 
         return new_feat, weightNetInput
 
@@ -343,19 +339,20 @@ class PointConvSimple(nn.Module):
             self,
             in_channel,
             out_channel,
-            cfg,
             weightnet=[9, 16],
             norm_layer = 'bn',
+            act_layer = F.relu(inplace=True),
             USE_VI=False,
             USE_PE=False,
-            USE_CUDA_KERNEL=True):
+            USE_CUDA_KERNEL=True,
+            dropout_rate=0.0):
         super(PointConvSimple, self).__init__()
-        self.cfg = cfg
         self.in_channel = in_channel
         self.out_channel = out_channel
 
         self.USE_VI = USE_VI
         self.USE_PE = USE_PE
+        self.act_layer = act_layer
         last_ch = in_channel
         if USE_PE:
             if self.USE_VI:
@@ -367,19 +364,24 @@ class PointConvSimple(nn.Module):
 
         self.weightnet = WeightNet(weightnet[0], weightnet[1], efficient=True)
 
+        if norm_layer == 'bn':
+            self.norm_layer = PermutedBN(out_channel)
+        elif callable(norm_layer):
+            self.norm_layer = norm_layer
+        else:
+            self.norm_layer = None
+
         if self.USE_CUDA_KERNEL:
             self.pconv_linear_opt = PConvLinearOpt(last_ch * weightnet[-1], out_channel)
-            if self.norm_layer == 'bn':
-                self.norm_layer = PermutedBN(out_channel)
         else:
-            if self.norm_layer == 'bn':
+            if norm_layer == 'bn':
                 self.linear = Linear_BN(
                     last_ch * weightnet[-1], out_channel, bn_ver='1d')
             else:
                 self.linear = nn.Linear(last_ch * weightnet[-1], out_channel)
 
         self.dropout = nn.Dropout(
-            p=cfg.dropout_rate) if cfg.dropout_rate > 0. else nn.Identity()
+            p=dropout_rate) if dropout_rate > 0. else nn.Identity()
 
     def forward(
             self,
@@ -470,7 +472,7 @@ class PointConvSimple(nn.Module):
             new_feat = self.norm_layer(new_feat)
 
         # new_feat = F.relu(new_feat, inplace=True)
-        new_feat = F.relu(new_feat)
+        new_feat = self.act_layer(new_feat)
 
         # Dropout
         new_feat = self.dropout(new_feat)
@@ -515,12 +517,14 @@ class PointConvTranspose(nn.Module):
             drop_path_rate=0.0,
             norm_layer = 'bn',
             USE_PE = True,
+            USE_VI = True,
             USE_CUDA_KERNEL = True,
             mlp2=None):
         super(PointConvTranspose, self).__init__()
         self.in_channel = in_channel
         self.out_channel = out_channel
         self.USE_PE = USE_PE
+        self.USE_VI = USE_VI
         self.norm_layer = norm_layer
 
         self.drop_path = DropPath(
@@ -549,7 +553,7 @@ class PointConvTranspose(nn.Module):
             if self.norm_layer == 'bn':
                 self.norm_layer = PermutedBN(out_channel, momentum=0.1)
         else:
-            if self.norm_layer == 'bn':
+                self.linear = nn.Linear((last_ch + in_channel) * weightnet[-1], out_channel)
                 # self.linear = Linear_BN(
                 #                 (last_ch + out_channel) * weightnet[-1], out_channel, bn_ver='1d')
                 self.linear = Linear_BN((last_ch + in_channel) * weightnet[-1], out_channel, bn_ver='1d')
@@ -562,7 +566,6 @@ class PointConvTranspose(nn.Module):
             p=dropout_rate) if dropout_rate > 0. else nn.Identity()
 
         self.mlp2_convs = nn.ModuleList()
-        self.mlp2_bns = nn.ModuleList()
         if mlp2 is not None:
             for i in range(1, len(mlp2)):
                 if self.norm_layer == 'bn':

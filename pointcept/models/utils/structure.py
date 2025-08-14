@@ -116,7 +116,7 @@ class Point(Dict):
         Point cloud is sparse, here we use "sparsify" to specifically refer to
         preparing "spconv.SparseConvTensor" for SpConv.
 
-        relay on ["grid_coord" or "coord" + "grid_size", "batch", "feat"]
+        rely on ["grid_coord" or "coord" + "grid_size", "batch", "feat"]
 
         pad: padding sparse for sparse shape.
         """
