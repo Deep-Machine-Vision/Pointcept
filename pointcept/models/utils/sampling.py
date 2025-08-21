@@ -1,3 +1,9 @@
+import torch
+import torch_scatter
+from addict import Dict
+from .structure import Point
+
+
 def grid_sampling(point, stride = 2, traceable = False, reduce = 'mean', pad=1):
     assert reduce in ["sum", "mean", "min", "max"]
     # Grid Sampling taken from PTv3 code
@@ -29,6 +35,7 @@ def grid_sampling(point, stride = 2, traceable = False, reduce = 'mean', pad=1):
     idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
     # head_indices of each cluster, for reduce attr e.g. code, batch
     head_indices = indices[idx_ptr[:-1]]
+    print(point.feat.shape)
     point_dict = Dict(
         feat=torch_scatter.segment_csr(
             point.feat[indices], idx_ptr, reduce= reduce

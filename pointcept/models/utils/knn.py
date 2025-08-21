@@ -10,6 +10,7 @@ try:
 except ImportError:
     keops_available = False
 try:
+    import cuvs as cp
     from cuvs.neighbors import brute_force
 except ImportError:
     cuvs_available = False

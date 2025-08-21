@@ -1,7 +1,11 @@
 from pointcept.models.builder import MODELS
 from pointcept.models.utils.structure import Point
-from pointcept.utils.knn import compute_knn
-from pointcept.utils.sampling import grid_sampling
+from pointcept.models.utils.knn import compute_knn
+from pointcept.models.utils.sampling import grid_sampling
+from pointcept.models.modules import PointModule
+from .pointconv import PointLinearLayer, PointConvResBlock, PointConvTranspose
+import torch.nn as nn
+import torch
 
 try:
     import pcf_cuda
@@ -51,7 +55,7 @@ class PointConv_Encoder(PointModule):
 
         self.embedding = PointLinearLayer(
             in_channels=in_channels,
-            embed_channels=enc_channels[0],
+            out_channels=enc_channels[0],
             norm_layer=norm_layer,
             act_layer=act_layer
         )
@@ -87,6 +91,9 @@ class PointConv_Encoder(PointModule):
         """
         point.coord = point.coord.float()
         
+        print(point.feat.shape)
+        # Add a leading dimension of 1 for PointConv
+        point.feat = point.feat.unsqueeze(0)
         # Initial embedding
         point.feat = self.embedding(point.feat)
 
@@ -186,8 +193,13 @@ class PointConv_Decoder(PointModule):
             weightnet = [weightnet_input_dim, weightnet_middim[i-1]]
             # Upsampling PointConvTranspose
             self.pointconv_transpose.append(
-                PointConvTranspose(
-                    in_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, weightnet, norm_layer, act_layer, drop_out_rate, drop_path_rate
+                PointConvTranspose(in_ch, out_ch, weightnet, 
+                                    dropout_rate = 0.0,
+                                    drop_path_rate=0.0,
+                                    norm_layer = norm_layer,
+                                    USE_PE = True,
+                                    USE_VI = USE_VI,
+                                    USE_CUDA_KERNEL = self.USE_CUDA_KERNEL
                 )
             )
             if dec_depths[i - 1] == 0:

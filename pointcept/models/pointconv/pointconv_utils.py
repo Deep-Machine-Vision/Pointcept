@@ -215,7 +215,7 @@ def VI_coordinate_transform(localized_xyz, gathered_norm, sparse_xyz_norm, K):
                       localized_xyz],
                      dim=3).contiguous()
 
-class PermutedBN(nn.Module):
+class PermutedBN(torch.nn.Module):
     '''
     Permuted Batch Normalization layer
     '''

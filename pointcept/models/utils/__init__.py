@@ -7,3 +7,4 @@ from .misc import (
 )
 from .checkpoint import checkpoint
 from .serialization import encode, decode
+from .knn import compute_knn

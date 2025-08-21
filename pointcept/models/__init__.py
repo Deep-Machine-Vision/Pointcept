@@ -8,6 +8,7 @@ from .point_transformer import *
 from .point_transformer_v2 import *
 from .point_transformer_v3 import *
 from .stratified_transformer import *
+from .pointconv import *
 from .spvcnn import *
 from .octformer import *
 from .oacnns import *

@@ -5,10 +5,10 @@ import torch
 import torch.utils.checkpoint as checkpoint
 import torch.nn.functional as F
 import torch.nn as nn
-from pointconv_utils import PConvLinearOpt, index_points, VI_coordinate_transform
+from .pointconv_utils import PConvLinearOpt, index_points, VI_coordinate_transform
 # Treatments to deal with batch normalization and gradient checkpointing for batch normalization
 # Can be removed if not using batch normalization
-from pointconv_utils import CheckpointFunction,CpBatchNorm2d,Linear_BN,PermutedBN,_bn_function_factory
+from .pointconv_utils import CheckpointFunction,CpBatchNorm2d,Linear_BN,PermutedBN,_bn_function_factory
 
 
 class PointLinearLayer(nn.Module):
@@ -22,7 +22,8 @@ class PointLinearLayer(nn.Module):
         if norm_layer == 'bn':
             self.linear = Linear_BN(in_channels, out_channels, bn_ver='1d')
         else:
-            if not callable(norm_layer):
+            # norm_layer can also be None, then there is no normalization
+            if norm_layer and not callable(norm_layer):
                 raise AssertionError("norm_layer must be 'bn' or a function pointer")
             self.linear = nn.Linear(in_channels, out_channels)
 
@@ -62,7 +63,7 @@ class WeightNet(nn.Module):
             out_channel,
             hidden_unit=[8, 8],
             norm_layer = 'bn',
-            act_layer = F.relu(inplace=True),
+            act_layer = torch.nn.ReLU(inplace=True),
             efficient=False):
         super(WeightNet, self).__init__()
 
@@ -148,7 +149,7 @@ class PointConvResBlock(nn.Module):
                  USE_CUDA_KERNEL = True,
                  weightnet=[9, 16], 
                  norm_layer = 'bn',
-                 act_layer = F.leaky_relu(0.1,inplace=True),
+                 act_layer = torch.nn.LeakyReLU(0.1,inplace=True),
                  drop_out_rate = 0.0, 
                  drop_path_rate=0.0):
         super(PointConvResBlock, self).__init__()
@@ -168,7 +169,7 @@ class PointConvResBlock(nn.Module):
 
         # First downscaling mlp
         if in_channel != out_channel // 4:
-            self.unary1 = UnaryBlock(
+            self.unary1 = PointLinearLayer(
                 in_channel,
                 out_channel // 4,
                 norm_layer = norm_layer)
@@ -341,7 +342,7 @@ class PointConvSimple(nn.Module):
             out_channel,
             weightnet=[9, 16],
             norm_layer = 'bn',
-            act_layer = F.relu(inplace=True),
+            act_layer = torch.nn.ReLU(inplace=True),
             USE_VI=False,
             USE_PE=False,
             USE_CUDA_KERNEL=True,
@@ -514,6 +515,7 @@ class PointConvTranspose(nn.Module):
             in_channel,
             out_channel,
             weightnet=[9, 16],
+            dropout_rate = 0.0,
             drop_path_rate=0.0,
             norm_layer = 'bn',
             USE_PE = True,
@@ -525,10 +527,10 @@ class PointConvTranspose(nn.Module):
         self.out_channel = out_channel
         self.USE_PE = USE_PE
         self.USE_VI = USE_VI
+        self.USE_CUDA_KERNEL = USE_CUDA_KERNEL
         self.norm_layer = norm_layer
 
-        self.drop_path = DropPath(
-            drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
 # This part can save a bit of memory, maybe with some performance drop or maybe no drop at all
 #        self.unary1 = UnaryBlock(
 #            in_channel,
@@ -553,12 +555,9 @@ class PointConvTranspose(nn.Module):
             if self.norm_layer == 'bn':
                 self.norm_layer = PermutedBN(out_channel, momentum=0.1)
         else:
-                self.linear = nn.Linear((last_ch + in_channel) * weightnet[-1], out_channel)
+            self.linear = nn.Linear((last_ch + in_channel) * weightnet[-1], out_channel)
                 # self.linear = Linear_BN(
                 #                 (last_ch + out_channel) * weightnet[-1], out_channel, bn_ver='1d')
-                self.linear = Linear_BN((last_ch + in_channel) * weightnet[-1], out_channel, bn_ver='1d')
-            else:
-                self.linear = nn.Linear((last_ch + in_channel) * weightnet[-1], out_channel, bn_ver='1d')
     #            self.linear = nn.Linear(
     #                (last_ch + out_channel) * weightnet[-1], out_channel)
 
