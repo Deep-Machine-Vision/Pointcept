@@ -154,7 +154,6 @@ class PointConv_Decoder(PointModule):
                  point_dim=3, # Dimensionality of the point cloud
                  dec_depths=(0, 0, 0, 0),
                  dec_channels=(32, 64, 128, 192, 256),
-                 final_out_channel = 20, # Number of output channels (e.g. classes)
                  dec_patch_size=(16, 16, 16, 16),
                  USE_VI=True, 
                  USE_CUDA_KERNEL=True,
@@ -204,10 +203,8 @@ class PointConv_Decoder(PointModule):
                 self.pointconv_res.append(res_blocks)
     
         # pointwise_decode
-        self.fc1 = PointLinearLayer(dec_channels[0], dec_channels[0], norm_layer=norm_layer, act_layer=act_layer)
         self.dropout = torch.nn.Dropout(
             p=drop_out_rate) if drop_out_rate > 0. else nn.Identity()
-        self.fc2 = nn.Linear(dec_channels[0], final_out_channel)
 
     def forward(self, point_list):
         """
@@ -260,10 +257,7 @@ class PointConv_Decoder(PointModule):
                         up_point.coord, up_point.feat, up_point.neighbors, up_point.normal, **inv_self_args)
             point = up_point
 
-        fc = self.dropout(self.act_layer(self.fc1(point.feat)))
-        fc = self.fc2(fc)
-
-        return fc
+        return point
 
 @MODELS.register_module("PointConvUNet")
 class PointConvUNet(PointModule):
@@ -278,7 +272,6 @@ class PointConvUNet(PointModule):
                  enc_patch_size = [16, 16, 16, 16, 16],
                  dec_depths=(0,0, 0, 0),
                  dec_channels=(32, 64, 128, 192, 256),
-                 final_out_channel = 20, # Number of output channels (e.g. classes)
                  dec_patch_size=(16, 16, 16, 16),
                  USE_PE=True, 
                  USE_VI=True, 
@@ -308,7 +301,6 @@ class PointConvUNet(PointModule):
             point_dim=point_dim,
             dec_depths=dec_depths,
             dec_channels=dec_channels,
-            final_out_channel=final_out_channel,
             dec_patch_size=dec_patch_size,
             USE_VI=USE_VI,
             USE_CUDA_KERNEL=USE_CUDA_KERNEL,
@@ -325,7 +317,7 @@ class PointConvUNet(PointModule):
         Args:
             point (Point): Input point cloud with features.
         Returns:
-            point_list (list): List of Point objects after each encoding and decoding stage.
+            output (Point): Output featurized point cloud after encoding and decoding.
         """
         point_list = self.encoder(point)
         output = self.decoder(point_list)
