@@ -224,6 +224,29 @@ class PointConvResBlock(nn.Module):
         inv_k: tensor (batch_size, num_points2), inverse k for the CUDA kernel
         inv_idx: tensor (batch_size, num_points2, K), inverse indices for the CUDA kernel
         """
+        no_batch = False
+        # Deal with no batch dimension case
+        if dense_xyz.dim() == 2:
+            dense_xyz = dense_xyz.unsqueeze(0)
+        if sparse_xyz is not None and sparse_xyz.dim() == 2:
+            sparse_xyz = sparse_xyz.unsqueeze(0)
+        if dense_feats.dim() == 2:
+            dense_feats = dense_feats.unsqueeze(0)
+            no_batch = True
+        if nei_inds.dim() == 2:
+            nei_inds = nei_inds.unsqueeze(0)
+        if dense_xyz_norm is not None and dense_xyz_norm.dim() == 2:
+            dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
+        if sparse_xyz_norm is not None and sparse_xyz_norm.dim() == 2:
+            sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
+        if vi_features is not None and vi_features.dim() == 2:
+            vi_features = vi_features.unsqueeze(0)
+        if inv_neighbors is not None and inv_neighbors.dim() == 2:
+            inv_neighbors = inv_neighbors.unsqueeze(0)
+        if inv_k is not None and inv_k.dim() == 2:
+            inv_k = inv_k.unsqueeze(0)
+        if inv_idx is not None and inv_idx.dim() == 2:
+            inv_idx = inv_idx.unsqueeze(0)
         B, N, _ = dense_xyz.shape
         if sparse_xyz is not None:
             _, M, _ = sparse_xyz.shape
@@ -306,6 +329,9 @@ class PointConvResBlock(nn.Module):
 
         new_feat = self.act_layer(self.drop_path(new_feat) + shortcut)
 
+        if no_batch:
+            new_feat = new_feat.squeeze(0)
+            weightNetInput = weightNetInput.squeeze(0)
         return new_feat, weightNetInput
 
 class PointConvSimple(nn.Module):
@@ -404,6 +430,27 @@ class PointConvSimple(nn.Module):
         sparse_xyz_norm: normals of the sparse xyz, tensor (batch_size, num_points2, 3)
         norms are required if USE_VI is true
         """
+        no_batch = False
+        # Deal with no batch dimension case
+        if dense_xyz.dim() == 2:
+            dense_xyz = dense_xyz.unsqueeze(0)
+        if sparse_xyz is not None and sparse_xyz.dim() == 2:
+            sparse_xyz = sparse_xyz.unsqueeze(0)
+        if dense_feats.dim() == 2:
+            dense_feats = dense_feats.unsqueeze(0)
+            no_batch = True
+        if nei_inds.dim() == 2:
+            nei_inds = nei_inds.unsqueeze(0)
+        if dense_xyz_norm is not None and dense_xyz_norm.dim() == 2:
+            dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
+        if sparse_xyz_norm is not None and sparse_xyz_norm.dim() == 2:
+            sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
+        if inv_neighbors is not None and inv_neighbors.dim() == 2:
+            inv_neighbors = inv_neighbors.unsqueeze(0)
+        if inv_k is not None and inv_k.dim() == 2:
+            inv_k = inv_k.unsqueeze(0)
+        if inv_idx is not None and inv_idx.dim() == 2:
+            inv_idx = inv_idx.unsqueeze(0)
         B, N, _ = dense_xyz.shape
         if sparse_xyz is not None:
             _, M, _ = sparse_xyz.shape
@@ -478,6 +525,9 @@ class PointConvSimple(nn.Module):
         # Dropout
         new_feat = self.dropout(new_feat)
 
+        if no_batch:
+            new_feat = new_feat.squeeze(0)
+            weightNetInput = weightNetInput.squeeze(0)
         return new_feat, weightNetInput
 
 class PointConvTranspose(nn.Module):
@@ -592,7 +642,38 @@ class PointConvTranspose(nn.Module):
         sparse_xyz: tensor (batch_size, num_points2, 3)
         dense_feats: tensor (batch_size, num_points, num_dims)
         nei_inds: tensor (batch_size, num_points2, K)
+        sparse_xyz_norm: tensor (batch_size, num_points2, 3)
+        dense_xyz_norm: tensor (batch_size, num_points, 3)
+        norms are required if USE_VI is true
+        inv_neighbors: tensor (batch_size, num_points2, K), inverse neighbors for the CUDA kernel
+        inv_k: tensor (batch_size, num_points2), inverse k for the CUDA kernel
+        inv_idx: tensor (batch_size, num_points2, K), inverse indices for the CUDA kernel
         """
+        no_batch = False
+        # Deal with no batch dimension case
+        if dense_xyz.dim() == 2:
+            dense_xyz = dense_xyz.unsqueeze(0)
+        if sparse_xyz.dim() == 2:
+            sparse_xyz = sparse_xyz.unsqueeze(0)
+        if dense_feats is not None and dense_feats.dim() == 2:
+            dense_feats = dense_feats.unsqueeze(0)
+        if sparse_feats.dim() == 2:
+            sparse_feats = sparse_feats.unsqueeze(0)
+            no_batch = True
+        if nei_inds.dim() == 2:
+            nei_inds = nei_inds.unsqueeze(0)
+        if sparse_xyz_norm.dim() == 2:
+            sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
+        if dense_xyz_norm.dim() == 2:
+            dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
+        if vi_features is not None and vi_features.dim() == 2:
+            vi_features = vi_features.unsqueeze(0)
+        if inv_neighbors is not None and inv_neighbors.dim() == 2:
+            inv_neighbors = inv_neighbors.unsqueeze(0)  
+        if inv_k is not None and inv_k.dim() == 2:
+            inv_k = inv_k.unsqueeze(0)
+        if inv_idx is not None and inv_idx.dim() == 2:
+            inv_idx = inv_idx.unsqueeze(0)
         B, _, _ = sparse_xyz.shape
         _, M, _ = dense_xyz.shape
         _, _, K = nei_inds.shape

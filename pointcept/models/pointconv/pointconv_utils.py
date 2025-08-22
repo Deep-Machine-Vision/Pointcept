@@ -148,7 +148,11 @@ def index_points(points, idx):
         new_points:, indexed points data, shape [B, S, C] / [B, S, K, C]
     """
     device = points.device
-    B = points.shape[0]
+    if points.dim() == 2:
+        view_shape = list(idx.shape)
+        return points[idx, :]
+    else:
+        B = points.shape[0]
     view_shape = list(idx.shape)
     view_shape[1:] = [1] * (len(view_shape) - 1)
     repeat_shape = list(idx.shape)
@@ -217,14 +221,19 @@ def VI_coordinate_transform(localized_xyz, gathered_norm, sparse_xyz_norm, K):
 
 class PermutedBN(torch.nn.Module):
     '''
-    Permuted Batch Normalization layer
+    Permuted Batch Normalization layer, now works for 2D-tensor (N x C) and 3D-tensor inputs (B x N x C)
     '''
     def __init__(self, out_dim, momentum=0.1):
         super(PermutedBN, self).__init__()
         self.bn = torch.nn.BatchNorm1d(out_dim, momentum=momentum)
 
     def forward(self, x):
-        return self.bn(x.permute(0, 2, 1)).permute(0, 2, 1)
+        if x.dim() == 2:
+            return self.bn(x)
+        if x.dim() == 3:
+            return self.bn(x.permute(0, 2, 1)).permute(0, 2, 1)
+        else:
+            raise NotImplementedError
 
 # We did not like that the pyTorch batch normalization requires C to be the 2nd dimension of the Tensor
 # It's hard to deal with it during training time, but we can fuse it during inference time
@@ -269,5 +278,35 @@ class Linear_BN(torch.nn.Module):
         if self.bn_ver == '2d':
             return self.bn(x.permute(0, 3, 2, 1)).permute(0, 3, 2, 1)
         else:
+            if x.dim() == 2:
+                return self.bn(x)
             return self.bn(x.permute(0, 2, 1)).permute(0, 2, 1)
 
+
+def replace_bn_layers(module: torch.nn.Module, verbose: bool = True):
+    """
+    Recursively replace any submodule that has a callable `.fuse()` method.
+    Returns (module, num_fused).
+    """
+    fused_count = 0
+
+    # First recurse so we fuse deepest children before parents
+    for name, child in list(module.named_children()):
+        new_child, child_fused = replace_bn_layers(child, verbose=verbose)
+        if child_fused:
+            module._modules[name] = new_child
+            fused_count += child_fused
+
+    # If this module itself supports `.fuse()`, use it
+    if hasattr(module, "fuse") and callable(getattr(module, "fuse")):
+        try:
+            fused = module.fuse()
+            if not isinstance(fused, nn.Module):
+                raise TypeError(f"fuse() must return an nn.Module, got {type(fused)}")
+            if verbose:
+                print(f"Fused: {module.__class__.__name__} -> {fused.__class__.__name__}")
+            return fused, fused_count + 1
+        except Exception as e:
+            raise RuntimeError(f"Failed to fuse {module}: {e}") from e
+
+    return module, fused_count
