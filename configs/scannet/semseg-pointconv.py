@@ -11,16 +11,16 @@ enable_amp = True
 model = dict(
     type="DefaultSegmentorV2",
     num_classes=20,
-    backbone_out_channels=64,
+    backbone_out_channels=32,
     backbone=dict(
         type="PointConvUNet",
         in_channels=6,
         enc_depths=(2,2,2,6,2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_patch_size=(16,16,16,16,16),
-        dec_depths=(0,0,0,0),
-        dec_channels=(32,64,128,192,256),
-        dec_patch_size=(16,16,16,16),
+        dec_depths=(0,0,0,0,0),
+        dec_channels=(32,64,128,256,512),
+        dec_patch_size=(16,16,16,16,16),
         USE_PE = True,
         USE_VI = True,
         USE_CUDA_KERNEL = True,
@@ -114,7 +114,7 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "grid_coord", "segment"),
+                keys=("coord", "grid_coord", "segment", "normal"),
                 feat_keys=("coord", "color"),
             ),
         ],
@@ -140,8 +140,8 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
-                feat_keys=("coord", "color", "normal"),
+                keys=("coord", "grid_coord", "segment", "origin_segment", "inverse","normal"),
+                feat_keys=("coord", "color"),
             ),
         ],
         test_mode=False,
@@ -169,8 +169,8 @@ data = dict(
                 dict(type="ToTensor"),
                 dict(
                     type="Collect",
-                    keys=("coord", "grid_coord", "index"),
-                    feat_keys=("coord", "color", "normal"),
+                    keys=("coord", "grid_coord", "index", "normal"),
+                    feat_keys=("coord", "color"),
                 ),
             ],
             aug_transform=[

@@ -57,7 +57,7 @@ class PointConv_Encoder(PointModule):
             in_channels=in_channels,
             out_channels=enc_channels[0],
             norm_layer=norm_layer,
-            act_layer=act_layer
+            act_layer=act_layer, bn_ver='1d'
         )
         self.pointconv = nn.ModuleList()
         self.pointconv_res = nn.ModuleList()
@@ -91,15 +91,12 @@ class PointConv_Encoder(PointModule):
         """
         point.coord = point.coord.float()
         
-        print(point.feat.shape)
-        # Add a leading dimension of 1 for PointConv
-        point.feat = point.feat.unsqueeze(0)
-        # Initial embedding
+         # Initial embedding
         point.feat = self.embedding(point.feat)
 
         point_list = [point]
 
-        if not hasattr(point, "neighbors") or point.neighbors is None:
+        if not hasattr(point, "neighbors") or len(point.neighbors) == 0:
             point.neighbors = compute_knn(
                 point.coord, point.coord, K=self.enc_patch_size[0])
 
@@ -109,7 +106,7 @@ class PointConv_Encoder(PointModule):
             down_point = grid_sampling(point, reduce='mean')
             down_point.neighbors = compute_knn(
                 down_point.coord, down_point.coord, K=self.enc_patch_size[i + 1])
-            if not hasattr(point, "neighbors_down") or point.neighbors_down is None:
+            if not hasattr(point, "neighbors_down") or len(point.neighbors_down) == 0:
                 point.neighbors_down = compute_knn(
                     point.coord, down_point.coord, K=self.enc_patch_size[i])
             if self.USE_CUDA_KERNEL:
@@ -119,12 +116,10 @@ class PointConv_Encoder(PointModule):
                                     "inv_k": inv_k,
                                     "inv_idx": inv_idx
                                 }
-
-            if self.USE_CUDA_KERNEL:
-                sparse_feat, _ = pointconv(
+                down_point.feat, _ = pointconv(
                     point.coord, point.feat, point.neighbors_down, point.normal, down_point.coord, down_point.normal, **inv_fwd_args)
             else:
-                sparse_feat = pointconv(
+                down_point.feat, _ = pointconv(
                     point.coord, point.feat, point.neighbors_down, point.normal, down_point.coord, down_point.normal)
             # print(sparse_feat.shape)
             # There is the need to recompute VI features from the neighbors at this level rather than from the previous level, hence need
@@ -159,7 +154,7 @@ class PointConv_Decoder(PointModule):
     """
     def __init__(self, 
                  point_dim=3, # Dimensionality of the point cloud
-                 dec_depths=(0, 0, 0, 0),
+                 dec_depths=(0, 0, 0, 0, 0),
                  dec_channels=(32, 64, 128, 192, 256),
                  dec_patch_size=(16, 16, 16, 16),
                  USE_VI=True, 
@@ -232,7 +227,7 @@ class PointConv_Decoder(PointModule):
         for i, pointconv_transpose in enumerate(self.pointconv_transpose):
             up_point = point_list[len(point_list) - i - 2]
             # Upsampling (stride-2) PointConvTranspose
-            if not hasattr(point, "neighbors_up") or point.neighbors_up is None:
+            if not hasattr(point, "neighbors_up") or point.neighbors_up is None or len(point.neighbors_up) == 0:
                 point.neighbors_up = compute_knn(
                     point.coord, up_point.coord, K=self.dec_patch_size[len(self.dec_patch_size) - i - 1])
             if self.USE_CUDA_KERNEL:
@@ -245,7 +240,7 @@ class PointConv_Decoder(PointModule):
                 dense_feat, _ = pointconv_transpose(
                     point.coord, point.feat, point.neighbors_up, point.normal, up_point.coord, up_point.normal, up_point.feat, **inv_fwd_args)
             else:
-                dense_feat = pointconv_transpose(
+                dense_feat, _ = pointconv_transpose(
                     point.coord, point.feat, point.neighbors_up, point.normal, up_point.coord, up_point.normal, up_point.feat)
             up_point.feat = dense_feat
 

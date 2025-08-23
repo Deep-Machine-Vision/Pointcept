@@ -15,12 +15,12 @@ class PointLinearLayer(nn.Module):
     """
     A simple linear layer for point clouds with fused batch normalization if bn is chosen as the normalization layer and optional activation layer
     """
-    def __init__(self, in_channels, out_channels, norm_layer=None, act_layer=None):
+    def __init__(self, in_channels, out_channels, norm_layer=None, act_layer=None, bn_ver='2d'):
         super(PointLinearLayer, self).__init__()
         self.act_layer = act_layer
         self.norm_layer = norm_layer
         if norm_layer == 'bn':
-            self.linear = Linear_BN(in_channels, out_channels, bn_ver='1d')
+            self.linear = Linear_BN(in_channels, out_channels, bn_ver)
         else:
             # norm_layer can also be None, then there is no normalization
             if norm_layer and not callable(norm_layer):
@@ -161,6 +161,7 @@ class PointConvResBlock(nn.Module):
         self.drop_path = DropPath(
             drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.act_layer = act_layer
+        self.norm_layer = norm_layer
 
         # positonal encoder
         self.pe_convs = WeightNet(
@@ -172,7 +173,7 @@ class PointConvResBlock(nn.Module):
             self.unary1 = PointLinearLayer(
                 in_channel,
                 out_channel // 4,
-                norm_layer = norm_layer)
+                norm_layer = norm_layer, bn_ver = '1d')
         else:
             self.unary1 = nn.Identity()
 
@@ -184,17 +185,17 @@ class PointConvResBlock(nn.Module):
                 self.norm_layer = PermutedBN(out_channel // 2, momentum=0.1)
         else: 
             # we would have to do normalization separately because the CUDA kernel doesn't have normalization built in it
-            self.linear = PointLinearLayer((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2, norm_layer=None, act_layer=None)
+            self.linear = PointLinearLayer((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2, norm_layer=None, act_layer=None, bn_ver = '1d')
 
         self.dropout = nn.Dropout(
             p=drop_out_rate) if drop_out_rate > 0. else nn.Identity()
 
         # Second upscaling mlp
-        self.unary2 = PointLinearLayer(out_channel // 2, out_channel, norm_layer = norm_layer, act_layer = None)
+        self.unary2 = PointLinearLayer(out_channel // 2, out_channel, norm_layer = norm_layer, act_layer = None, bn_ver = '1d')
 
         # Shortcut optional mlp
         if in_channel != out_channel:
-            self.unary_shortcut = PointLinearLayer(in_channel,out_channel,norm_layer = norm_layer, act_layer = None)
+            self.unary_shortcut = PointLinearLayer(in_channel,out_channel,norm_layer = norm_layer, act_layer = None, bn_ver = '1d')
         else:
             self.unary_shortcut = nn.Identity()
 
@@ -228,18 +229,18 @@ class PointConvResBlock(nn.Module):
         # Deal with no batch dimension case
         if dense_xyz.dim() == 2:
             dense_xyz = dense_xyz.unsqueeze(0)
-        if sparse_xyz is not None and sparse_xyz.dim() == 2:
+        if sparse_xyz is not None and len(sparse_xyz) > 0 and sparse_xyz.dim() == 2:
             sparse_xyz = sparse_xyz.unsqueeze(0)
         if dense_feats.dim() == 2:
             dense_feats = dense_feats.unsqueeze(0)
             no_batch = True
         if nei_inds.dim() == 2:
             nei_inds = nei_inds.unsqueeze(0)
-        if dense_xyz_norm is not None and dense_xyz_norm.dim() == 2:
+        if dense_xyz_norm is not None and len(dense_xyz_norm) > 0 and dense_xyz_norm.dim() == 2:
             dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
-        if sparse_xyz_norm is not None and sparse_xyz_norm.dim() == 2:
+        if sparse_xyz_norm is not None and len(sparse_xyz_norm) > 0 and sparse_xyz_norm.dim() == 2:
             sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
-        if vi_features is not None and vi_features.dim() == 2:
+        if vi_features is not None and vi_features.dim() == 3:
             vi_features = vi_features.unsqueeze(0)
         if inv_neighbors is not None and inv_neighbors.dim() == 2:
             inv_neighbors = inv_neighbors.unsqueeze(0)
@@ -268,7 +269,7 @@ class PointConvResBlock(nn.Module):
         feat_pe = self.pe_convs(localized_xyz)  # [B, M, K, D]
 
         if self.USE_VI is True:
-            if dense_xyz_norm is None:
+            if dense_xyz_norm is None or len(dense_xyz_norm) == 0:
                 raise AssertionError(
                     "dense_xyz_norm must be provided for VI features")
             gathered_norm = index_points(dense_xyz_norm, nei_inds)
@@ -434,16 +435,16 @@ class PointConvSimple(nn.Module):
         # Deal with no batch dimension case
         if dense_xyz.dim() == 2:
             dense_xyz = dense_xyz.unsqueeze(0)
-        if sparse_xyz is not None and sparse_xyz.dim() == 2:
+        if sparse_xyz is not None and len(sparse_xyz) > 0 and sparse_xyz.dim() == 2:
             sparse_xyz = sparse_xyz.unsqueeze(0)
         if dense_feats.dim() == 2:
             dense_feats = dense_feats.unsqueeze(0)
             no_batch = True
         if nei_inds.dim() == 2:
             nei_inds = nei_inds.unsqueeze(0)
-        if dense_xyz_norm is not None and dense_xyz_norm.dim() == 2:
+        if dense_xyz_norm is not None and len(dense_xyz_norm) > 0 and dense_xyz_norm.dim() == 2:
             dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
-        if sparse_xyz_norm is not None and sparse_xyz_norm.dim() == 2:
+        if sparse_xyz_norm is not None and len(sparse_xyz_norm) > 0 and sparse_xyz_norm.dim() == 2:
             sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
         if inv_neighbors is not None and inv_neighbors.dim() == 2:
             inv_neighbors = inv_neighbors.unsqueeze(0)
@@ -655,18 +656,18 @@ class PointConvTranspose(nn.Module):
             dense_xyz = dense_xyz.unsqueeze(0)
         if sparse_xyz.dim() == 2:
             sparse_xyz = sparse_xyz.unsqueeze(0)
-        if dense_feats is not None and dense_feats.dim() == 2:
+        if dense_feats is not None and len(dense_feats) > 0 and dense_feats.dim() == 2:
             dense_feats = dense_feats.unsqueeze(0)
         if sparse_feats.dim() == 2:
             sparse_feats = sparse_feats.unsqueeze(0)
             no_batch = True
         if nei_inds.dim() == 2:
             nei_inds = nei_inds.unsqueeze(0)
-        if sparse_xyz_norm.dim() == 2:
+        if sparse_xyz_norm is not None and len(sparse_xyz_norm) > 0 and sparse_xyz_norm.dim() == 2:
             sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
-        if dense_xyz_norm.dim() == 2:
+        if dense_xyz_norm is not None and len(dense_xyz_norm) > 0 and dense_xyz_norm.dim() == 2:
             dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
-        if vi_features is not None and vi_features.dim() == 2:
+        if vi_features is not None and vi_features.dim() == 3:
             vi_features = vi_features.unsqueeze(0)
         if inv_neighbors is not None and inv_neighbors.dim() == 2:
             inv_neighbors = inv_neighbors.unsqueeze(0)  
@@ -736,4 +737,7 @@ class PointConvTranspose(nn.Module):
         for conv in self.mlp2_convs:
             new_feat = F.relu(conv(new_feat), inplace=True)
 
+        if no_batch is True:
+            new_feat = new_feat.squeeze(0)
+            weightNetInput = weightNetInput.squeeze(0)
         return new_feat, weightNetInput

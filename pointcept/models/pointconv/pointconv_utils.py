@@ -275,7 +275,7 @@ class Linear_BN(torch.nn.Module):
 
     def forward(self, x):
         x = self.c(x)
-        if self.bn_ver == '2d':
+        if x.dim() == 4:
             return self.bn(x.permute(0, 3, 2, 1)).permute(0, 3, 2, 1)
         else:
             if x.dim() == 2:

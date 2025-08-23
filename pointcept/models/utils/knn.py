@@ -7,11 +7,13 @@ import numpy as np
 from sklearn.neighbors import KDTree
 try:
     from pykeops.torch import LazyTensor
+    keops_available = True
 except ImportError:
     keops_available = False
 try:
-    import cuvs as cp
+    import cupy as cp
     from cuvs.neighbors import brute_force
+    cuvs_available = True
 except ImportError:
     cuvs_available = False
 
@@ -45,7 +47,7 @@ def knn_cuvs_brute_force(ref_points, query_points, K):
     index = brute_force.build(ref_points, metric='sqeuclidean')
 
     dist, ind = brute_force.search(index, query_points, K)
-    ind = cp.asarray(ind)
+    ind = torch.as_tensor(ind)
     return ind
 
 def compute_knn(ref_points, query_points, K, dilated_rate=1, method='cuvs_brute_force'):
