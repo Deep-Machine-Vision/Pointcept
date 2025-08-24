@@ -7,6 +7,7 @@ from .structure import Point
 def grid_sampling(point, stride = 2, traceable = False, reduce = 'mean', pad=1):
     assert reduce in ["sum", "mean", "min", "max"]
     # Grid Sampling taken from PTv3 code
+    eps = 1e-6
     if "grid_coord" in point.keys():
         grid_coord = point.grid_coord
     elif {"coord", "grid_size"}.issubset(point.keys()):
@@ -35,7 +36,6 @@ def grid_sampling(point, stride = 2, traceable = False, reduce = 'mean', pad=1):
     idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
     # head_indices of each cluster, for reduce attr e.g. code, batch
     head_indices = indices[idx_ptr[:-1]]
-    print(point.feat.shape)
     point_dict = Dict(
         feat=torch_scatter.segment_csr(
             point.feat[indices], idx_ptr, reduce= reduce
@@ -67,8 +67,8 @@ def grid_sampling(point, stride = 2, traceable = False, reduce = 'mean', pad=1):
             point.normal[indices], idx_ptr, reduce=reduce
         )
         # Make sure it's still a unit vector after reduction
-        point_dict["normal"] = point_dict["normal"] / torch.norm(
-            point_dict["normal"], dim=-1, keepdim=True
+        point_dict["normal"] = point_dict["normal"] / ((torch.norm(
+            point_dict["normal"], dim=-1, keepdim=True) + eps)
         )
     if "grid_size" in point.keys():
         point_dict["grid_size"] = point.grid_size * stride

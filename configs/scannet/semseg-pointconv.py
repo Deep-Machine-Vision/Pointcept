@@ -1,7 +1,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 2  # bs: total bs in all gpus
+batch_size = 6 # bs: total bs in all gpus
 num_worker = 20
 mix_prob = 0.8
 empty_cache = False
@@ -37,16 +37,16 @@ model = dict(
 
 # scheduler settings
 epoch = 800
-optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
+optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.0001)
 scheduler = dict(
     type="OneCycleLR",
-    max_lr=[0.006, 0.0006],
+    max_lr=[0.001, 0.0001],
     pct_start=0.05,
     anneal_strategy="cos",
     div_factor=10.0,
     final_div_factor=1000.0,
 )
-param_dicts = [dict(keyword="block", lr=0.0006)]
+param_dicts = [dict(keyword="block", lr=0.0001)]
 
 # dataset settings
 dataset_type = "ScanNetDataset"

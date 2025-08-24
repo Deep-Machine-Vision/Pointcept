@@ -242,6 +242,7 @@ class PointConv_Decoder(PointModule):
             else:
                 dense_feat, _ = pointconv_transpose(
                     point.coord, point.feat, point.neighbors_up, point.normal, up_point.coord, up_point.normal, up_point.feat)
+
             up_point.feat = dense_feat
 
             vi_features = None

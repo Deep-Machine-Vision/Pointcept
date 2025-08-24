@@ -148,11 +148,7 @@ def index_points(points, idx):
         new_points:, indexed points data, shape [B, S, C] / [B, S, K, C]
     """
     device = points.device
-    if points.dim() == 2:
-        view_shape = list(idx.shape)
-        return points[idx, :]
-    else:
-        B = points.shape[0]
+    B = points.shape[0]
     view_shape = list(idx.shape)
     view_shape[1:] = [1] * (len(view_shape) - 1)
     repeat_shape = list(idx.shape)

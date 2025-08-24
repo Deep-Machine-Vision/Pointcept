@@ -740,4 +740,6 @@ class PointConvTranspose(nn.Module):
         if no_batch is True:
             new_feat = new_feat.squeeze(0)
             weightNetInput = weightNetInput.squeeze(0)
+        if len(torch.nonzero(torch.isnan(new_feat) | torch.isinf(new_feat))):
+            print('Infs/NaNs found in PointConvTranspose layer')
         return new_feat, weightNetInput
