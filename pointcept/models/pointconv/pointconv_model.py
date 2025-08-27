@@ -110,7 +110,8 @@ class PointConv_Encoder(PointModule):
                 point.neighbors_down = compute_knn(
                     point.coord, down_point.coord, K=self.enc_patch_size[i])
             if self.USE_CUDA_KERNEL:
-                inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(point.neighbors_down, point.coord.shape[0])
+                add_dim_neighbors = point.neighbors_down.unsqueeze(0)
+                inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, point.coord.shape[0])
                 inv_fwd_args = {
                                     "inv_neighbors": inv_n,
                                     "inv_k": inv_k,
@@ -126,7 +127,9 @@ class PointConv_Encoder(PointModule):
             # to recompute VI features in the first residual block
             vi_features = None
             if self.USE_CUDA_KERNEL:
-                inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(down_point.neighbors, down_point.coord.shape[0])
+                add_dim_neighbors = down_point.neighbors.unsqueeze(0)
+                print(down_point.coord.shape)
+                inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, down_point.coord.shape[0])
 
             for res_block in self.pointconv_res[i]:
                 inv_self_args = {}
@@ -231,7 +234,8 @@ class PointConv_Decoder(PointModule):
                 point.neighbors_up = compute_knn(
                     point.coord, up_point.coord, K=self.dec_patch_size[len(self.dec_patch_size) - i - 1])
             if self.USE_CUDA_KERNEL:
-                inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(point.neighbors_up, point.coord.shape[0])
+                add_dim_neighbors = point.neighbors_up.unsqueeze(0)
+                inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, up_point.coord.shape[0])
                 inv_fwd_args = {
                     "inv_neighbors": inv_n,
                     "inv_k": inv_k,
@@ -247,7 +251,8 @@ class PointConv_Decoder(PointModule):
 
             vi_features = None
             if self.USE_CUDA_KERNEL:
-                inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(up_point.neighbors, up_point.coord.shape[0])
+                add_dim_neighbors = up_point.neighbors.unsqueeze(0)
+                inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, up_point.coord.shape[0])
 
             for res_block in self.pointconv_res[i]:
                 inv_self_args = {}

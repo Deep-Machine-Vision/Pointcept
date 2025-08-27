@@ -9,7 +9,9 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/util/host_tensor.h>
 #include <cutlass/half.h>
@@ -18,11 +20,90 @@
 #include <cutlass/gemm/device/gemm.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
+
+template <typename T> struct ToCutlass{ using type = T; };  // primary definition
+template <> struct ToCutlass<float>        { using type = float; };
+template <> struct ToCutlass<at::Half>     { using type = cutlass::half_t; };
+template <> struct ToCutlass<at::BFloat16> { using type = cutlass::bfloat16_t; };
+
+// Pick a conservative arch tag (Ampere+). 
+// If you *know* you target H100/H200, you can switch to Sm90.
+using DefaultArchTag = cutlass::arch::Sm80;
+using DefaultOpClass = cutlass::arch::OpClassSimt; // simple & widely supported (works for fp32/fp16/bf16). 
+
+
 using namespace nvcuda;
 
 namespace pcf {
 namespace pconv_ops {
 
+template <typename T>
+__device__ inline void atomicAddT(T* addr, T val);  // fwd decl
+
+template <>
+__device__ inline void atomicAddT<float>(float* addr, float val) {
+    atomicAdd(addr, val);
+}
+
+template <>
+__device__ inline void atomicAddT<double>(double* addr, double val) {
+    atomicAdd(addr, val);
+}
+
+
+template <>
+__device__ inline void atomicAddT<at::Half>(at::Half* addr, at::Half val) {
+#if __CUDA_ARCH__ >= 700
+    // Native half atomicAdd
+    atomicAdd(reinterpret_cast<__half*>(addr),
+              *reinterpret_cast<const __half*>(&val));
+#else
+    // 16-bit CAS emulation
+    uintptr_t u = reinterpret_cast<uintptr_t>(addr);
+    unsigned int* base = reinterpret_cast<unsigned int*>(u & ~0x3);
+    bool high = (u & 0x2) != 0;
+    unsigned int old_word, assumed;
+    do {
+        old_word = *base;
+        unsigned short old_bits = high ? (old_word >> 16) : (old_word & 0xFFFFu);
+        __half old_h; *reinterpret_cast<unsigned short*>(&old_h) = old_bits;
+        float f = __half2float(old_h) + __half2float(*reinterpret_cast<const __half*>(&val));
+        __half new_h = __float2half(f);
+        unsigned short new_bits = *reinterpret_cast<unsigned short*>(&new_h);
+        unsigned int new_word = high ? ((old_word & 0x0000FFFFu) | (unsigned(new_bits) << 16))
+                                     : ((old_word & 0xFFFF0000u) | new_bits);
+        assumed = atomicCAS(base, old_word, new_word);
+    } while (assumed != old_word);
+#endif
+}
+
+template <>
+__device__ inline void atomicAddT<at::BFloat16>(at::BFloat16* addr, at::BFloat16 val) {
+#if __CUDA_ARCH__ >= 800
+    // Native bf16 atomicAdd on Ampere+ (sm_80+)
+    atomicAdd(reinterpret_cast<__nv_bfloat16*>(addr),
+              *reinterpret_cast<const __nv_bfloat16*>(&val));
+#else
+    // 16-bit CAS emulation for bf16
+    uintptr_t u = reinterpret_cast<uintptr_t>(addr);
+    unsigned int* base = reinterpret_cast<unsigned int*>(u & ~0x3);
+    bool high = (u & 0x2) != 0;
+    unsigned int old_word, assumed;
+    do {
+        old_word = *base;
+        unsigned short old_bits = high ? (old_word >> 16) : (old_word & 0xFFFFu);
+        __nv_bfloat16 old_b; *reinterpret_cast<unsigned short*>(&old_b) = old_bits;
+        float f = __bfloat162float(old_b) + __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&val));
+        __nv_bfloat16 new_b = __float2bfloat16(f);
+        unsigned short new_bits = *reinterpret_cast<unsigned short*>(&new_b);
+        unsigned int new_word = high ? ((old_word & 0x0000FFFFu) | (unsigned(new_bits) << 16))
+                                     : ((old_word & 0xFFFF0000u) | new_bits);
+        assumed = atomicCAS(base, old_word, new_word);
+    } while (assumed != old_word);
+#endif
+}
 /** 
  * input: B x M x C_in tensor, B = batch size, M = number of points in the original point cloud, C_in = number of channels, input features
  * neighbor_inds: B x N x K tensor, K = neighborhood size, indices of the neighborhood of each point
@@ -275,7 +356,7 @@ __global__ void pconv_cuda_backward_kernel(
                     weight_grad_temp += grad_output[ii][i][cur_channel] * input[ii][neighbor_inds[ii][i][k]][kk];
 
                     // It would be quite expensive to store this in shared memory so use this naive approach for now, using atomicAdd to avoid racing conditions
-                    atomicAdd(&grad_input[ii][neighbor_inds[ii][i][k]][kk], cur_compute);
+                    atomicAddT<scalar_t>(&grad_input[ii][neighbor_inds[ii][i][k]][kk], cur_compute);
             }
 
             for (kk=0;kk<C_add;kk++) {
@@ -358,7 +439,7 @@ __global__ void pconv_linear_cuda_backward_kernel(
             for (int c = 0; c < C_in; c++) {
                     const int grad_idx = c_mid * (C_in + C_add) + c;
                     const scalar_t grad_val = shared_grad[grad_idx];
-                    atomicAdd(&grad_input[batch_idx][neighbor_inds[batch_idx][point_idx][k]][c],
+                    atomicAddT<scalar_t>(&grad_input[batch_idx][neighbor_inds[batch_idx][point_idx][k]][c],
                             grad_val * weights[batch_idx][point_idx][k][c_mid]);
                     weight_grad += grad_val * input[batch_idx][neighbor_inds[batch_idx][point_idx][k]][c];
             }
@@ -378,12 +459,12 @@ __global__ void pconv_linear_cuda_backward_kernel(
 
             // Linear weights gradient
             for (int c = 0; c < total_channels; c++) {
-                    atomicAdd(&grad_linear_weights[tid][c],
+                    atomicAddT<scalar_t>(&grad_linear_weights[tid][c],
                             bias_grad * pconv_output[batch_idx][point_idx][c]);
             }
 
             // Linear bias gradient
-            atomicAdd(&grad_linear_bias[tid], bias_grad);
+            atomicAddT<scalar_t>(&grad_linear_bias[tid], bias_grad);
     }
 }
 
@@ -391,9 +472,9 @@ template <typename scalar_t>
 __global__ void pconv_linear_fused_cuda_backward_kernel_opt(
     const torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits> grad_output,
     const torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits> input,
-    const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> inverse_neighbor,
+    const torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> inverse_neighbor,
     const torch::PackedTensorAccessor32<uint8_t, 2, torch::RestrictPtrTraits> inverse_neighbor_k,
-    const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> inverse_neighbor_idx,
+    const torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> inverse_neighbor_idx,
     const torch::PackedTensorAccessor32<long, 3, torch::RestrictPtrTraits> neighbor_inds,
     const torch::PackedTensorAccessor32<scalar_t, 4, torch::RestrictPtrTraits> weights,
     const torch::PackedTensorAccessor32<scalar_t, 4, torch::RestrictPtrTraits> additional_features,
@@ -428,7 +509,7 @@ __global__ void pconv_linear_fused_cuda_backward_kernel_opt(
 
     // Process output points
     if (tid < C_out) {
-            atomicAdd(&grad_linear_bias[tid], grad_output[batch_idx][point_idx][tid]);
+            atomicAddT<scalar_t>(&grad_linear_bias[tid], grad_output[batch_idx][point_idx][tid]);
     }
 
     for (int c = tid; c < total_channels; c += blockDim.x) {
@@ -448,9 +529,9 @@ __global__ void pconv_linear_fused_cuda_backward_kernel_opt(
             scalar_t weight_grad = 0;
 
             const long n_idx_long = neighbor_inds[batch_idx][point_idx][k];
-            const int32_t n_idx = static_cast<int32_t>(n_idx_long);
+            const int64_t n_idx = static_cast<int64_t>(n_idx_long);
 
-            if (n_idx >= 0 && n_idx < N && n_idx < static_cast<int32_t>(input.size(1))) {
+            if (n_idx >= 0 && n_idx < N && n_idx < static_cast<int64_t>(input.size(1))) {
                     for (int c_in = 0; c_in < C_in; c_in++) {
                             const int grad_idx = mid_idx * (C_in + C_add) + c_in;
                             if (grad_idx < total_channels) {
@@ -489,12 +570,12 @@ __global__ void pconv_linear_fused_cuda_backward_kernel_opt(
 
     for (int k = 0; k < K; k++) {
             const long n_idx_long = neighbor_inds[batch_idx][point_idx][k];
-            const int32_t n_idx = static_cast<int32_t>(n_idx_long);
+            const int64_t n_idx = static_cast<int64_t>(n_idx_long);
 
             if (n_idx >= 0 && 
                 n_idx < N && 
-                n_idx < static_cast<int32_t>(input.size(1)) && 
-                n_idx < static_cast<int32_t>(grad_input.size(1))) {
+                n_idx < static_cast<int64_t>(input.size(1)) && 
+                n_idx < static_cast<int64_t>(grad_input.size(1))) {
 
                     for (int c_in = tid; c_in < C_in; c_in += blockDim.x) {
                             scalar_t input_grad = 0;
@@ -507,7 +588,7 @@ __global__ void pconv_linear_fused_cuda_backward_kernel_opt(
                             }
 
                             if (c_in < C_in && c_in < static_cast<int>(grad_input.size(2))) {
-                                    atomicAdd(&grad_input[batch_idx][n_idx][c_in], input_grad);
+                                    atomicAddT<scalar_t>(&grad_input[batch_idx][n_idx][c_in], input_grad);
                             }
                     }
             }
@@ -526,7 +607,7 @@ __global__ void pconv_linear_fused_cuda_backward_kernel_opt(
                             c_out < C_out && 
                             c < static_cast<int>(grad_linear_weights.size(1)) &&
                             c_out < static_cast<int>(grad_linear_weights.size(0))) {
-                            atomicAdd(&grad_linear_weights[c_out][c], 
+                            atomicAddT<scalar_t>(&grad_linear_weights[c_out][c], 
                                         grad_out * pconv_output[batch_idx][point_idx][c]);
                     }
             }
@@ -539,9 +620,9 @@ template <typename scalar_t>
 __global__ void input_only_backward_kernel(
     const torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits> grad_output,
     const torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits> input,
-    const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> inverse_neighbor,
+    const torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> inverse_neighbor,
     const torch::PackedTensorAccessor32<uint8_t, 2, torch::RestrictPtrTraits> inverse_neighbor_k,
-    const torch::PackedTensorAccessor32<int32_t, 2, torch::RestrictPtrTraits> inverse_neighbor_idx,
+    const torch::PackedTensorAccessor32<int64_t, 2, torch::RestrictPtrTraits> inverse_neighbor_idx,
     const torch::PackedTensorAccessor32<scalar_t, 4, torch::RestrictPtrTraits> weights,
     const torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> linear_weights,
     torch::PackedTensorAccessor32<scalar_t, 3, torch::RestrictPtrTraits> grad_input,
@@ -618,30 +699,37 @@ __global__ void input_only_backward_kernel(
     }
 }
 
+template <typename scalar_t>
 __global__ void gather_kernel(
-    const float* input,
-    const float* additional_features,
-    const int64_t* neighbor_inds,
-    float* concatenated_output,
-    int B, int M, int Nout, int K, int C_in, int C_add)
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ additional_features,
+    const int64_t* __restrict__ neighbor_inds,
+    scalar_t* __restrict__ concatenated_output,
+    int B, int M, int Nout, int K, int C_in, int C_add) 
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = B * Nout * K * (C_in + C_add);
     if (idx >= total) return;
 
-    const int b = idx / (Nout * K * (C_in + C_add));
-    int rem = idx % (Nout * K * (C_in + C_add));
-    const int n = rem / (K * (C_in + C_add));
-    rem %= (K * (C_in + C_add));
-    const int k = rem / (C_in + C_add);
-    const int c = rem % (C_in + C_add);
+    int t = idx;
+    const int c = t % (C_in + C_add); t /= (C_in + C_add);
+    const int k = t % K;               t /= K;
+    const int n = t % Nout;            t /= Nout;
+    const int b = t; // 0..B-1
 
-    const int64_t neighbor_idx = neighbor_inds[b * Nout * K + n * K + k];
+    const int64_t n_idx = neighbor_inds[b * (int64_t)Nout * K + n * (int64_t)K + k];
+
     if (c < C_in) {
-            concatenated_output[idx] = input[b * M * C_in + neighbor_idx * C_in + c];
+        // from indexed input
+        concatenated_output[idx] =
+            input[b * (int64_t)M * C_in + n_idx * (int64_t)C_in + c];
     } else {
-            int c_add = c - C_in;
-            concatenated_output[idx] = additional_features[b * Nout * K * C_add + n * K * C_add + k * C_add + c_add];
+        // from additional features (no indexing on M)
+        const int ca = c - C_in;
+        concatenated_output[idx] =
+            additional_features[b * (int64_t)Nout * K * C_add +
+                                n * (int64_t)K * C_add +
+                                k * (int64_t)C_add + ca];
     }
 }
 
@@ -661,11 +749,11 @@ torch::Tensor pconv_cuda_forward(
     const int numThreads = C_mid * C_in > 256 ? 256 : C_mid * C_in;
 
     const int K = neighbor_inds.size(2);
-    const int shared_mem_size = (K * (C_in + C_add)) * sizeof(float);   // shared memory size for input and additional features
+    const int shared_mem_size = (K * (C_in + C_add)) * sizeof(input.scalar_type());   // shared memory size for input and additional features
 
-    auto output = torch::zeros({B, Nout, C_mid * (C_in + C_add)}, input.type());
+    auto output = torch::zeros({B, Nout, C_mid * (C_in + C_add)}, input.scalar_type());
 
-    AT_DISPATCH_FLOATING_TYPES(output.scalar_type(), "pconv_cuda_forward_kernel", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, output.scalar_type(), "pconv_cuda_forward_kernel", ([&] {
     pconv_cuda_forward_kernel<scalar_t><<<numBlocks, numThreads, shared_mem_size>>>(
                 input.packed_accessor32<scalar_t,3,torch::RestrictPtrTraits>(),
                 neighbor_inds.packed_accessor32<long,3,torch::RestrictPtrTraits>(),
@@ -718,9 +806,9 @@ std::vector<torch::Tensor> pconv_linear_cuda_forward(
                                         (K * C_add) +                   // shared_additional  
                                         (K * C_mid) +                   // shared_weights
                                         (C_mid * (C_in + C_add))        // shared_intermediate
-                                ) * sizeof(float);
+                                ) * sizeof(input.scalar_type());
 
-    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "pconv_linear_cuda_forward_kernel", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "pconv_linear_cuda_forward_kernel", ([&] {
                 pconv_linear_cuda_forward_kernel<scalar_t><<<grid, thread_count, shared_mem_size>>>(
                 input.packed_accessor32<scalar_t,3,torch::RestrictPtrTraits>(),
                 neighbor_inds.packed_accessor32<long,3,torch::RestrictPtrTraits>(),
@@ -760,7 +848,7 @@ std::vector<torch::Tensor> pconv_cuda_backward(
     auto grad_weights = torch::zeros_like(weights);
     auto grad_additional = torch::zeros_like(additional_features);
 
-    AT_DISPATCH_FLOATING_TYPES(grad_output.scalar_type(), "pconv_cuda_backward_kernel", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, grad_output.scalar_type(), "pconv_cuda_backward_kernel", ([&] {
                 pconv_cuda_backward_kernel<scalar_t><<<numBlocks,numThreads>>>(
                 grad_output.packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>(),
                 input.packed_accessor32<scalar_t,3,torch::RestrictPtrTraits>(),
@@ -823,9 +911,9 @@ std::vector<torch::Tensor> pconv_linear_cuda_backward(
     const int total_blocks = B * Nout;
     dim3 grid(total_blocks);
 
-    const int shared_mem_size = (C_mid * (C_in + C_add)) * sizeof(float);
+    const int shared_mem_size = (C_mid * (C_in + C_add)) * sizeof(input.scalar_type());
 
-    AT_DISPATCH_FLOATING_TYPES(grad_output.scalar_type(), "pconv_linear_cuda_backward_kernel", ([&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, grad_output.scalar_type(), "pconv_linear_cuda_backward_kernel", ([&] {
     pconv_linear_cuda_backward_kernel<scalar_t><<<grid, thread_count, shared_mem_size>>>(
                 grad_output.packed_accessor32<scalar_t,3,torch::RestrictPtrTraits>(),
                 input.packed_accessor32<scalar_t,3,torch::RestrictPtrTraits>(),
@@ -904,13 +992,13 @@ std::vector<torch::Tensor> pconv_linear_opt_cuda_backward(
     {
             const int total_blocks_main = B * Nout;
             dim3 grid(total_blocks_main);
-            AT_DISPATCH_FLOATING_TYPES(grad_output.scalar_type(), "pconv_linear_fused_cuda_backward_kernel_opt", ([&] {
+            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, grad_output.scalar_type(), "pconv_linear_fused_cuda_backward_kernel_opt", ([&] {
             pconv_linear_fused_cuda_backward_kernel_opt<scalar_t><<<grid, thread_count, shared_mem_size>>>(
                             grad_output.packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>(),
                             input.packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>(),
-                            inverse_neighbor.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+                            inverse_neighbor.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(),
                             inverse_neighbor_k.packed_accessor32<uint8_t, 2, torch::RestrictPtrTraits>(),
-                            inverse_neighbor_idx.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+                            inverse_neighbor_idx.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(),
                             neighbor_inds.packed_accessor32<long, 3, torch::RestrictPtrTraits>(),
                             weights.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
                             additional_features.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
@@ -930,13 +1018,13 @@ std::vector<torch::Tensor> pconv_linear_opt_cuda_backward(
             const int total_blocks_input = B * input_only_points;
             dim3 grid(total_blocks_input);
 
-            AT_DISPATCH_FLOATING_TYPES(grad_output.scalar_type(), "input_only_backward_kernel", ([&] {
+            AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, grad_output.scalar_type(), "input_only_backward_kernel", ([&] {
             input_only_backward_kernel<scalar_t><<<grid, thread_count>>>(
                             grad_output.packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>(),
                             input.packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>(),
-                            inverse_neighbor.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+                            inverse_neighbor.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(),
                             inverse_neighbor_k.packed_accessor32<uint8_t, 2, torch::RestrictPtrTraits>(),
-                            inverse_neighbor_idx.packed_accessor32<int32_t, 2, torch::RestrictPtrTraits>(),
+                            inverse_neighbor_idx.packed_accessor32<int64_t, 2, torch::RestrictPtrTraits>(),
                             weights.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
                             linear_weights.packed_accessor32<scalar_t, 2, torch::RestrictPtrTraits>(),
                             grad_input.packed_accessor32<scalar_t, 3, torch::RestrictPtrTraits>(),
@@ -966,6 +1054,287 @@ std::vector<torch::Tensor> pconv_linear_opt_cuda_backward(
 // - If Nout is large, input is split into manageable batches to reduce memory usage
 // - Both PConv and Linear GEMM are executed in batches accordingly
 //
+template <typename scalar_t>
+std::vector<torch::Tensor> pconv_linear_cutlass_forward_impl(
+    torch::Tensor input,
+    torch::Tensor neighbor_inds,
+    torch::Tensor weights,
+    torch::Tensor additional_features,
+    torch::Tensor linear_weights,
+    torch::Tensor linear_bias)
+{
+    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+    TORCH_CHECK(neighbor_inds.is_cuda(), "neighbor_inds must be CUDA");
+    TORCH_CHECK(weights.is_cuda(), "weights must be CUDA");
+    TORCH_CHECK(additional_features.is_cuda(), "additional_features must be CUDA");
+    TORCH_CHECK(linear_weights.is_cuda(), "linear_weights must be CUDA");
+    TORCH_CHECK(linear_bias.is_cuda(), "linear_bias must be CUDA");
+
+    // All dtypes must match
+    const auto dt = input.scalar_type();
+    TORCH_CHECK(weights.scalar_type() == dt &&
+                additional_features.scalar_type() == dt &&
+                linear_weights.scalar_type() == dt &&
+                linear_bias.scalar_type() == dt,
+                "All tensor dtypes must match input dtype.");
+
+    const int B      = input.size(0);
+    const int M      = input.size(1);
+    const int Nout   = neighbor_inds.size(1);
+    const int C_in   = input.size(2);
+    const int K      = neighbor_inds.size(2);
+    const int C_mid  = weights.size(3);
+    const int C_add  = additional_features.size(3);
+    const int C_out  = linear_weights.size(0);
+    const int C_concat = C_in + C_add;
+
+    const int batch_size   = 10000;
+    const bool use_batched = Nout > batch_size;
+
+    auto final_output = torch::zeros({B, Nout, C_out}, input.options());
+    auto pconv_output = torch::zeros({B, Nout, C_concat * C_mid}, input.options());
+
+    using Element  = typename ToCutlass<scalar_t>::type;
+    using AccumT   = float;
+    using LayoutA  = cutlass::layout::ColumnMajor;
+    using LayoutB  = cutlass::layout::RowMajor;
+    using LayoutC  = cutlass::layout::RowMajor;
+
+    if (use_batched) {
+        const int num_batches = (Nout + batch_size - 1) / batch_size;
+        for (int batch = 0; batch < num_batches; ++batch) {
+            const int start_idx   = batch * batch_size;
+            const int end_idx     = std::min(start_idx + batch_size, Nout);
+            const int batch_points = end_idx - start_idx;
+            if (batch_points <= 0) continue;
+
+            auto neigh_b  = neighbor_inds.slice(1, start_idx, end_idx);
+            auto add_b    = additional_features.slice(1, start_idx, end_idx);
+            auto W_b      = weights.slice(1, start_idx, end_idx);
+
+            auto concat_b = torch::zeros({B, batch_points, K, C_concat}, input.options());
+
+            const int threads = 256;
+            const int blocks  = (B * batch_points * K * C_concat + threads - 1) / threads;
+
+            // templated kernel launch
+            gather_kernel<scalar_t><<<blocks, threads>>>(
+                input.data_ptr<scalar_t>(),
+                additional_features.data_ptr<scalar_t>(),
+                neigh_b.data_ptr<int64_t>(),
+                concat_b.data_ptr<scalar_t>(),
+                B, M, batch_points, K, C_in, C_add
+            );
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            auto features         = concat_b.view({B * batch_points, K, C_concat});
+            auto weights_reshaped = W_b.view({B * batch_points, K, C_mid}).contiguous();
+            auto pconv_result     = torch::zeros({B * batch_points, C_concat, C_mid}, input.options());
+
+            using Gemm = cutlass::gemm::device::GemmBatched<
+                Element, LayoutA,
+                Element, LayoutB,
+                Element, LayoutC,
+                AccumT,
+                DefaultOpClass,
+                DefaultArchTag,
+                cutlass::gemm::GemmShape<64,64,8>,
+                cutlass::gemm::GemmShape<32,32,8>,
+                cutlass::gemm::GemmShape<1,1,1>
+            >;
+
+            Gemm gemm_op;
+            const int batch_count = B * batch_points;
+            const cutlass::gemm::GemmCoord problem_size(C_concat, C_mid, K);
+
+            cutlass::TensorRef<Element const, LayoutA> A_ref(
+                reinterpret_cast<Element const*>(features.data_ptr<scalar_t>()), C_concat);
+            cutlass::TensorRef<Element const, LayoutB> B_ref(
+                reinterpret_cast<Element const*>(weights_reshaped.data_ptr<scalar_t>()), C_mid);
+            cutlass::TensorRef<Element, LayoutC> C_ref(
+                reinterpret_cast<Element*>(pconv_result.data_ptr<scalar_t>()), C_mid);
+
+            const int64_t stride_A = K * C_concat;
+            const int64_t stride_B = K * C_mid;
+            const int64_t stride_C = C_concat * C_mid;
+
+            typename Gemm::EpilogueOutputOp::Params epilogue_op(1.0f, 0.0f);
+            typename Gemm::Arguments args(
+                problem_size,
+                A_ref, stride_A,
+                B_ref, stride_B,
+                C_ref, stride_C,
+                C_ref, stride_C,
+                epilogue_op,
+                batch_count
+            );
+
+            const size_t ws_size = Gemm::get_workspace_size(args);
+            auto workspace = torch::empty({static_cast<int64_t>(ws_size)}, input.options().dtype(torch::kUInt8));
+
+            auto st = gemm_op.initialize(args, workspace.data_ptr());
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS GEMM init failed");
+            st = gemm_op();
+            TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS GEMM run failed");
+
+            // [B*batch_points, C_concat, C_mid] -> [B, batch_points, C_concat*C_mid]
+            auto pconv_batch_output = pconv_result.view({B, batch_points, C_concat * C_mid});
+            pconv_output.slice(1, start_idx, end_idx).copy_(pconv_batch_output);
+
+            // Linear projection: (B*batch_points, K_linear) x (K_linear, C_out)
+            const int K_linear = C_concat * C_mid;
+            auto X_mat = pconv_batch_output.view({B * batch_points, K_linear});
+            auto W_t   = linear_weights.t().contiguous();
+            auto Y_b   = torch::zeros({B * batch_points, C_out}, input.options());
+
+            using GemmLinear = cutlass::gemm::device::Gemm<
+                Element, cutlass::layout::RowMajor,
+                Element, cutlass::layout::RowMajor,
+                Element, cutlass::layout::RowMajor,
+                AccumT,
+                DefaultOpClass,
+                DefaultArchTag,
+                cutlass::gemm::GemmShape<64,64,8>
+            >;
+            GemmLinear gemm_linear;
+            cutlass::gemm::GemmCoord problem_size_linear(B * batch_points, C_out, K_linear);
+
+            cutlass::TensorRef<Element const, cutlass::layout::RowMajor> X_ref(
+                reinterpret_cast<Element const*>(X_mat.data_ptr<scalar_t>()), K_linear);
+            cutlass::TensorRef<Element const, cutlass::layout::RowMajor> W_ref_linear(
+                reinterpret_cast<Element const*>(W_t.data_ptr<scalar_t>()), C_out);
+            cutlass::TensorRef<Element, cutlass::layout::RowMajor> Y_ref(
+                reinterpret_cast<Element*>(Y_b.data_ptr<scalar_t>()), C_out);
+
+            typename GemmLinear::EpilogueOutputOp::Params epilogue_op_linear(1.0f, 0.0f);
+            typename GemmLinear::Arguments args_linear(
+                problem_size_linear, X_ref, W_ref_linear, Y_ref, Y_ref, epilogue_op_linear
+            );
+
+            size_t ws_lin = GemmLinear::get_workspace_size(args_linear);
+            auto workspace_lin = torch::empty({static_cast<int64_t>(ws_lin)}, input.options().dtype(torch::kUInt8));
+
+            auto st_lin = gemm_linear.initialize(args_linear, workspace_lin.data_ptr());
+            TORCH_CHECK(st_lin == cutlass::Status::kSuccess, "CUTLASS linear GEMM init failed");
+            st_lin = gemm_linear();
+            TORCH_CHECK(st_lin == cutlass::Status::kSuccess, "CUTLASS linear GEMM run failed");
+
+            Y_b = Y_b + linear_bias.view({1, C_out});
+            final_output.slice(1, start_idx, end_idx).copy_(Y_b.view({B, batch_points, C_out}));
+        }
+    } else {
+        // For small point clouds, we process all at once
+        auto concat = torch::zeros({B, Nout, K, C_concat}, input.options());
+
+        const int threads = 256;
+        const int blocks  = (B * Nout * K * C_concat + threads - 1) / threads;
+
+        gather_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            additional_features.data_ptr<scalar_t>(),
+            neighbor_inds.data_ptr<int64_t>(),
+            concat.data_ptr<scalar_t>(),
+            B, M, Nout, K, C_in, C_add
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        auto features         = concat.view({B * Nout, K, C_concat});
+        auto weights_reshaped = weights.view({B * Nout, K, C_mid}).contiguous();
+        auto pconv_result     = torch::zeros({B * Nout, C_concat, C_mid}, input.options());
+
+        using Gemm = cutlass::gemm::device::GemmBatched<
+            Element, LayoutA,
+            Element, LayoutB,
+            Element, LayoutC,
+            AccumT,
+            DefaultOpClass,
+            DefaultArchTag,
+            cutlass::gemm::GemmShape<64,64,8>,
+            cutlass::gemm::GemmShape<32,32,8>,
+            cutlass::gemm::GemmShape<1,1,1>
+        >;
+
+        Gemm gemm_op;
+        const int batch_count = B * Nout;
+        const cutlass::gemm::GemmCoord problem_size(C_concat, C_mid, K);
+
+        cutlass::TensorRef<Element const, LayoutA> A_ref(
+            reinterpret_cast<Element const*>(features.data_ptr<scalar_t>()), C_concat);
+        cutlass::TensorRef<Element const, LayoutB> B_ref(
+            reinterpret_cast<Element const*>(weights_reshaped.data_ptr<scalar_t>()), C_mid);
+        cutlass::TensorRef<Element, LayoutC> C_ref(
+            reinterpret_cast<Element*>(pconv_result.data_ptr<scalar_t>()), C_mid);
+
+        const int64_t stride_A = K * C_concat;
+        const int64_t stride_B = K * C_mid;
+        const int64_t stride_C = C_concat * C_mid;
+
+        typename Gemm::EpilogueOutputOp::Params epilogue_op(1.0f, 0.0f);
+        typename Gemm::Arguments args(
+            problem_size,
+            A_ref, stride_A,
+            B_ref, stride_B,
+            C_ref, stride_C,
+            C_ref, stride_C,
+            epilogue_op,
+            batch_count
+        );
+
+        const size_t ws_size = Gemm::get_workspace_size(args);
+        auto workspace = torch::empty({static_cast<int64_t>(ws_size)}, input.options().dtype(torch::kUInt8));
+        auto st = gemm_op.initialize(args, workspace.data_ptr());
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS GEMM init failed");
+        st = gemm_op();
+        TORCH_CHECK(st == cutlass::Status::kSuccess, "CUTLASS GEMM run failed");
+
+        pconv_output = pconv_result.view({B, Nout, C_concat * C_mid});
+
+        const int K_linear = C_concat * C_mid;
+        auto X_mat = pconv_output.view({B * Nout, K_linear});
+        auto W_t   = linear_weights.t().contiguous();
+        auto Y     = torch::zeros({B * Nout, C_out}, input.options());
+
+        using GemmLinear = cutlass::gemm::device::Gemm<
+            Element, cutlass::layout::RowMajor,
+            Element, cutlass::layout::RowMajor,
+            Element, cutlass::layout::RowMajor,
+            AccumT,
+            DefaultOpClass,
+            DefaultArchTag,
+            cutlass::gemm::GemmShape<64,64,8>
+        >;
+        GemmLinear gemm_linear;
+
+        cutlass::gemm::GemmCoord problem_size_linear(B * Nout, C_out, K_linear);
+
+        cutlass::TensorRef<Element const, cutlass::layout::RowMajor> X_ref(
+            reinterpret_cast<Element const*>(X_mat.data_ptr<scalar_t>()), K_linear);
+        cutlass::TensorRef<Element const, cutlass::layout::RowMajor> W_ref_linear(
+            reinterpret_cast<Element const*>(W_t.data_ptr<scalar_t>()), C_out);
+        cutlass::TensorRef<Element, cutlass::layout::RowMajor> Y_ref(
+            reinterpret_cast<Element*>(Y.data_ptr<scalar_t>()), C_out);
+
+        typename GemmLinear::EpilogueOutputOp::Params epilogue_op_linear(1.0f, 0.0f);
+        typename GemmLinear::Arguments args_linear(
+            problem_size_linear, X_ref, W_ref_linear, Y_ref, Y_ref, epilogue_op_linear
+        );
+
+        size_t ws_lin = GemmLinear::get_workspace_size(args_linear);
+        auto workspace_lin = torch::empty({static_cast<int64_t>(ws_lin)}, input.options().dtype(torch::kUInt8));
+
+        auto st_lin = gemm_linear.initialize(args_linear, workspace_lin.data_ptr());
+        TORCH_CHECK(st_lin == cutlass::Status::kSuccess, "CUTLASS linear GEMM init failed");
+        st_lin = gemm_linear();
+        TORCH_CHECK(st_lin == cutlass::Status::kSuccess, "CUTLASS linear GEMM run failed");
+
+        Y = Y + linear_bias.view({1, C_out});
+        final_output = Y.view({B, Nout, C_out});
+    }
+
+    return {final_output, pconv_output};
+}
+
+// ---- Non-templated wrapper: this is the symbol you bind to Python ----
 std::vector<torch::Tensor> pconv_linear_cutlass_forward(
     torch::Tensor input,
     torch::Tensor neighbor_inds,
@@ -974,298 +1343,21 @@ std::vector<torch::Tensor> pconv_linear_cutlass_forward(
     torch::Tensor linear_weights,
     torch::Tensor linear_bias)
 {
-    const int B = input.size(0);
-    const int M = input.size(1);
-    const int Nout = neighbor_inds.size(1);
-    const int C_in = input.size(2);
-    const int K = neighbor_inds.size(2);
-    const int C_mid = weights.size(3);
-    const int C_add = additional_features.size(3);
-    const int C_out = linear_weights.size(0);
-    const int C_concat = C_in + C_add;
+    // dtype sanity
+    TORCH_CHECK(input.scalar_type() == weights.scalar_type() &&
+                input.scalar_type() == additional_features.scalar_type() &&
+                input.scalar_type() == linear_weights.scalar_type() &&
+                input.scalar_type() == linear_bias.scalar_type(),
+                "All tensor dtypes must match input dtype.");
 
-    const int batch_size = 10000;
-    const bool use_batched = Nout > batch_size;
-
-    auto final_output = torch::zeros({B, Nout, C_out}, input.options());
-    auto pconv_output = torch::zeros({B, Nout, C_concat * C_mid}, input.options());
-
-    if (use_batched) {
-            const int num_batches = (Nout + batch_size - 1) / batch_size;
-
-            for (int batch = 0; batch < num_batches; batch++) {
-                    const int start_idx = batch * batch_size;
-                    const int end_idx = std::min(start_idx + batch_size, Nout);
-                    const int batch_points = end_idx - start_idx;
-
-                    if (batch_points <= 0) continue;
-
-                    auto neighbor_inds_batch = neighbor_inds.slice(1, start_idx, end_idx);
-                    auto additional_features_batch = additional_features.slice(1, start_idx, end_idx);
-                    auto weights_batch = weights.slice(1, start_idx, end_idx);
-
-                    auto concatenated_batch = torch::zeros({B, batch_points, K, C_concat}, input.options());
-
-                    const int threads = 256;
-                    const int blocks = (B * batch_points * K * C_concat + threads - 1) / threads;
-
-                    gather_kernel<<<blocks, threads>>>(
-                                    input.data_ptr<float>(),
-                                    additional_features_batch.data_ptr<float>(),
-                                    neighbor_inds_batch.data_ptr<int64_t>(),
-                                    concatenated_batch.data_ptr<float>(),
-                                    B, M, batch_points, K, C_in, C_add
-                    );
-
-                    auto features = concatenated_batch.view({B * batch_points, K, C_concat});
-                    auto weights_reshaped = weights_batch.view({B * batch_points, K, C_mid}).contiguous();
-
-                    auto pconv_result = torch::zeros({B * batch_points, C_concat, C_mid}, input.options());
-
-                    using LayoutA = cutlass::layout::ColumnMajor;
-                    using LayoutB = cutlass::layout::RowMajor;
-                    using LayoutC = cutlass::layout::RowMajor;
-
-                    using Gemm = cutlass::gemm::device::GemmBatched<
-                                    float, LayoutA,
-                                    float, LayoutB,
-                                    float, LayoutC,
-                                    float,
-                                    cutlass::arch::OpClassSimt,
-                                    cutlass::arch::Sm90,
-                                    cutlass::gemm::GemmShape<64, 64, 8>,
-                                    cutlass::gemm::GemmShape<32, 32, 8>,
-                                    cutlass::gemm::GemmShape<1, 1, 1>
-                    >;
-
-                    Gemm gemm_op;
-                    cutlass::Status status;
-
-                    const int batch_count = B * batch_points;
-                    const cutlass::gemm::GemmCoord problem_size(C_concat, C_mid, K);
-
-                    cutlass::TensorRef<float const, LayoutA> A_ref(features.data_ptr<float>(), C_concat);
-                    cutlass::TensorRef<float const, LayoutB> B_ref(weights_reshaped.data_ptr<float>(), C_mid);
-                    cutlass::TensorRef<float, LayoutC> C_ref(pconv_result.data_ptr<float>(), C_mid);
-
-                    const int64_t stride_A = K * C_concat;
-                    const int64_t stride_B = K * C_mid;
-                    const int64_t stride_C = C_concat * C_mid;
-
-                    typename Gemm::EpilogueOutputOp::Params epilogue_op(1.0f, 0.0f);
-
-                    typename Gemm::Arguments args(
-                                    problem_size,
-                                    A_ref, stride_A,
-                                    B_ref, stride_B,
-                                    C_ref, stride_C,
-                                    C_ref, stride_C,
-                                    epilogue_op,
-                                    batch_count
-                    );
-
-                    const size_t workspace_size = Gemm::get_workspace_size(args);
-                    auto workspace = torch::empty({static_cast<int64_t>(workspace_size)}, input.options().dtype(torch::kUInt8));
-
-                    status = gemm_op.initialize(args, workspace.data_ptr());
-                    if (status != cutlass::Status::kSuccess) {
-                            throw std::runtime_error("CUTLASS GEMM initialization failed");
-                    }
-
-                    status = gemm_op();
-                    if (status != cutlass::Status::kSuccess) {
-                            throw std::runtime_error("CUTLASS GEMM execution failed");
-                    }
-
-                    // shape [B*batch_points, C_concat, C_mid]
-                    auto pconv_batch_output = pconv_result.view({B, batch_points, C_concat * C_mid});
-
-                    // Copy slice
-                    pconv_output.slice(1, start_idx, end_idx).copy_(pconv_batch_output);
-
-                    int K_linear = C_concat * C_mid;
-                    auto X_mat = pconv_batch_output.view({B * batch_points, K_linear});
-                    auto W_t = linear_weights.t().contiguous();
-
-                    auto Y_batch = torch::zeros({B * batch_points, C_out}, input.options());
-
-                    using GemmLinear = cutlass::gemm::device::Gemm<
-                                    float, cutlass::layout::RowMajor,
-                                    float, cutlass::layout::RowMajor,
-                                    float, cutlass::layout::RowMajor,
-                                    float,
-                                    cutlass::arch::OpClassSimt,
-                                    cutlass::arch::Sm90,
-                                    cutlass::gemm::GemmShape<64, 64, 8>,
-                                    cutlass::gemm::GemmShape<32, 32, 8>,
-                                    cutlass::gemm::GemmShape<1, 1, 1>
-                    >;
-
-                    GemmLinear gemm_linear;
-                    cutlass::gemm::GemmCoord problem_size_linear(B * batch_points, C_out, K_linear);
-
-                    cutlass::TensorRef<float const, cutlass::layout::RowMajor> X_ref(X_mat.data_ptr<float>(), K_linear);
-                    cutlass::TensorRef<float const, cutlass::layout::RowMajor> W_ref_linear(W_t.data_ptr<float>(), C_out);
-                    cutlass::TensorRef<float, cutlass::layout::RowMajor> Y_ref(Y_batch.data_ptr<float>(), C_out);
-
-                    typename GemmLinear::EpilogueOutputOp::Params epilogue_op_linear(1.0f, 0.0f);
-                    typename GemmLinear::Arguments args_linear(
-                                    problem_size_linear,
-                                    X_ref,
-                                    W_ref_linear,
-                                    Y_ref,
-                                    Y_ref,
-                                    epilogue_op_linear
-                    );
-
-                    size_t workspace_size_linear = GemmLinear::get_workspace_size(args_linear);
-                    auto workspace_linear = torch::empty({static_cast<int64_t>(workspace_size_linear)}, input.options().dtype(torch::kUInt8));
-
-                    auto status_linear = gemm_linear.initialize(args_linear, workspace_linear.data_ptr());
-                    if (status_linear != cutlass::Status::kSuccess) {
-                            throw std::runtime_error("CUTLASS GEMM (Linear) initialization failed");
-                    }
-                    status_linear = gemm_linear();
-                    if (status_linear != cutlass::Status::kSuccess) {
-                            throw std::runtime_error("CUTLASS GEMM (Linear) execution failed");
-                    }
-
-                    Y_batch = Y_batch + linear_bias.view({1, C_out});
-
-                    // Copy slice
-                    final_output.slice(1, start_idx, end_idx).copy_(Y_batch.view({B, batch_points, C_out}));
-            }
-    } else {
-            // For small point clouds, we process all at once
-            auto concatenated = torch::zeros({B, Nout, K, C_concat}, input.options());
-
-            const int threads = 256;
-            const int blocks = (B * Nout * K * C_concat + threads - 1) / threads;
-
-            gather_kernel<<<blocks, threads>>>(
-                            input.data_ptr<float>(),
-                            additional_features.data_ptr<float>(),
-                            neighbor_inds.data_ptr<int64_t>(),
-                            concatenated.data_ptr<float>(),
-                            B, M, Nout, K, C_in, C_add
+    std::vector<torch::Tensor> out;
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16,
+        input.scalar_type(), "pconv_linear_cutlass_forward", [&] {
+            out = pconv_linear_cutlass_forward_impl<scalar_t>(
+                input, neighbor_inds, weights, additional_features, linear_weights, linear_bias
             );
-
-            auto features = concatenated.view({B * Nout, K, C_concat});
-            auto weights_reshaped = weights.view({B * Nout, K, C_mid}).contiguous();
-
-            auto pconv_result = torch::zeros({B * Nout, C_concat, C_mid}, input.options());
-
-            using LayoutA = cutlass::layout::ColumnMajor;
-            using LayoutB = cutlass::layout::RowMajor;
-            using LayoutC = cutlass::layout::RowMajor;
-
-            using Gemm = cutlass::gemm::device::GemmBatched<
-                            float, LayoutA,
-                            float, LayoutB,
-                            float, LayoutC,
-                            float,
-                            cutlass::arch::OpClassSimt,
-                            cutlass::arch::Sm90,
-                            cutlass::gemm::GemmShape<64, 64, 8>,
-                            cutlass::gemm::GemmShape<32, 32, 8>,
-                            cutlass::gemm::GemmShape<1, 1, 1>
-            >;
-
-            Gemm gemm_op;
-            cutlass::Status status;
-
-            const int batch_count = B * Nout;
-            const cutlass::gemm::GemmCoord problem_size(C_concat, C_mid, K);
-
-            cutlass::TensorRef<float const, LayoutA> A_ref(features.data_ptr<float>(), C_concat);
-            cutlass::TensorRef<float const, LayoutB> B_ref(weights_reshaped.data_ptr<float>(), C_mid);
-            cutlass::TensorRef<float, LayoutC> C_ref(pconv_result.data_ptr<float>(), C_mid);
-
-            const int64_t stride_A = K * C_concat;
-            const int64_t stride_B = K * C_mid;
-            const int64_t stride_C = C_concat * C_mid;
-
-            typename Gemm::EpilogueOutputOp::Params epilogue_op(1.0f, 0.0f);
-
-            typename Gemm::Arguments args(
-                            problem_size,
-                            A_ref, stride_A,
-                            B_ref, stride_B,
-                            C_ref, stride_C,
-                            C_ref, stride_C,
-                            epilogue_op,
-                            batch_count
-            );
-
-            const size_t workspace_size = Gemm::get_workspace_size(args);
-            auto workspace = torch::empty({static_cast<int64_t>(workspace_size)}, input.options().dtype(torch::kUInt8));
-
-            status = gemm_op.initialize(args, workspace.data_ptr());
-            if (status != cutlass::Status::kSuccess) {
-                    throw std::runtime_error("CUTLASS GEMM initialization failed");
-            }
-
-            status = gemm_op();
-            if (status != cutlass::Status::kSuccess) {
-                    throw std::runtime_error("CUTLASS GEMM execution failed");
-            }
-
-            // shape [B*Nout, C_concat, C_mid]
-            pconv_output = pconv_result.view({B, Nout, C_concat * C_mid});
-
-            int K_linear = C_concat * C_mid;
-            auto X_mat = pconv_output.view({B * Nout, K_linear});
-            auto W_t = linear_weights.t().contiguous();
-
-            auto Y = torch::zeros({B * Nout, C_out}, input.options());
-
-            using GemmLinear = cutlass::gemm::device::Gemm<
-                            float, cutlass::layout::RowMajor,
-                            float, cutlass::layout::RowMajor,
-                            float, cutlass::layout::RowMajor,
-                            float,
-                            cutlass::arch::OpClassSimt,
-                            cutlass::arch::Sm90,
-                            cutlass::gemm::GemmShape<64, 64, 8>,
-                            cutlass::gemm::GemmShape<32, 32, 8>,
-                            cutlass::gemm::GemmShape<1, 1, 1>
-            >;
-
-            GemmLinear gemm_linear;
-            cutlass::gemm::GemmCoord problem_size_linear(B * Nout, C_out, K_linear);
-
-            cutlass::TensorRef<float const, cutlass::layout::RowMajor> X_ref(X_mat.data_ptr<float>(), K_linear);
-            cutlass::TensorRef<float const, cutlass::layout::RowMajor> W_ref_linear(W_t.data_ptr<float>(), C_out);
-            cutlass::TensorRef<float, cutlass::layout::RowMajor> Y_ref(Y.data_ptr<float>(), C_out);
-
-            typename GemmLinear::EpilogueOutputOp::Params epilogue_op_linear(1.0f, 0.0f);
-            typename GemmLinear::Arguments args_linear(
-                            problem_size_linear,
-                            X_ref,
-                            W_ref_linear,
-                            Y_ref,
-                            Y_ref,
-                            epilogue_op_linear
-            );
-
-            size_t workspace_size_linear = GemmLinear::get_workspace_size(args_linear);
-            auto workspace_linear = torch::empty({static_cast<int64_t>(workspace_size_linear)}, input.options().dtype(torch::kUInt8));
-
-            auto status_linear = gemm_linear.initialize(args_linear, workspace_linear.data_ptr());
-            if (status_linear != cutlass::Status::kSuccess) {
-                    throw std::runtime_error("CUTLASS GEMM (Linear) initialization failed");
-            }
-            status_linear = gemm_linear();
-            if (status_linear != cutlass::Status::kSuccess) {
-                    throw std::runtime_error("CUTLASS GEMM (Linear) execution failed");
-            }
-
-            Y = Y + linear_bias.view({1, C_out});
-
-            final_output = Y.view({B, Nout, C_out});
-    }
-
-    return {final_output, pconv_output};
+        });
+    return out;
 }
 
 } // namespace pconv_ops

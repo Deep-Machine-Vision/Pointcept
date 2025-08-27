@@ -242,12 +242,6 @@ class PointConvResBlock(nn.Module):
             sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
         if vi_features is not None and vi_features.dim() == 3:
             vi_features = vi_features.unsqueeze(0)
-        if inv_neighbors is not None and inv_neighbors.dim() == 2:
-            inv_neighbors = inv_neighbors.unsqueeze(0)
-        if inv_k is not None and inv_k.dim() == 2:
-            inv_k = inv_k.unsqueeze(0)
-        if inv_idx is not None and inv_idx.dim() == 2:
-            inv_idx = inv_idx.unsqueeze(0)
         B, N, _ = dense_xyz.shape
         if sparse_xyz is not None:
             _, M, _ = sparse_xyz.shape
@@ -295,7 +289,9 @@ class PointConvResBlock(nn.Module):
 
         if self.USE_CUDA_KERNEL:
             feats_x = feats_x.contiguous()
-            nei_inds = nei_inds.contiguous()
+            # When the point cloud size drop under K, contiguous will make it int32
+            # so we have to convert it back to avoid a bug
+            nei_inds = nei_inds.contiguous().long()
             weights = weights.contiguous()
             feat_pe = feat_pe.contiguous()
             new_feat = self.pconv_linear_opt(feats_x,nei_inds,inv_neighbors, inv_k, inv_idx, 
@@ -446,12 +442,6 @@ class PointConvSimple(nn.Module):
             dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
         if sparse_xyz_norm is not None and len(sparse_xyz_norm) > 0 and sparse_xyz_norm.dim() == 2:
             sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
-        if inv_neighbors is not None and inv_neighbors.dim() == 2:
-            inv_neighbors = inv_neighbors.unsqueeze(0)
-        if inv_k is not None and inv_k.dim() == 2:
-            inv_k = inv_k.unsqueeze(0)
-        if inv_idx is not None and inv_idx.dim() == 2:
-            inv_idx = inv_idx.unsqueeze(0)
         B, N, _ = dense_xyz.shape
         if sparse_xyz is not None:
             _, M, _ = sparse_xyz.shape
@@ -495,7 +485,9 @@ class PointConvSimple(nn.Module):
         if self.USE_CUDA_KERNEL:
             dense_feats = dense_feats.contiguous()
             weights = weights.contiguous()
-            nei_inds = nei_inds.contiguous()
+            # When the point cloud size drop under K, contiguous will make it int32
+            # so we have to convert it back to avoid a bug
+            nei_inds = nei_inds.contiguous().long()
             new_feat = self.pconv_linear_opt(
                                                 dense_feats,
                                                 nei_inds,
@@ -669,12 +661,6 @@ class PointConvTranspose(nn.Module):
             dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
         if vi_features is not None and vi_features.dim() == 3:
             vi_features = vi_features.unsqueeze(0)
-        if inv_neighbors is not None and inv_neighbors.dim() == 2:
-            inv_neighbors = inv_neighbors.unsqueeze(0)  
-        if inv_k is not None and inv_k.dim() == 2:
-            inv_k = inv_k.unsqueeze(0)
-        if inv_idx is not None and inv_idx.dim() == 2:
-            inv_idx = inv_idx.unsqueeze(0)
         B, _, _ = sparse_xyz.shape
         _, M, _ = dense_xyz.shape
         _, _, K = nei_inds.shape
@@ -706,7 +692,10 @@ class PointConvTranspose(nn.Module):
 
         if self.USE_CUDA_KERNEL:
             feats_x = feats_x.contiguous()
-            nei_inds = nei_inds.contiguous()
+
+            # When the point cloud size drop under K, contiguous will make it int32
+            # so we have to convert it back to avoid a bug
+            nei_inds = nei_inds.contiguous().long()
             weights = weights.contiguous()
 
             if self.USE_PE:

@@ -1,5 +1,6 @@
 import torch
 from torch.nn import functional as F
+import pcf_cuda
 import warnings
 
 
@@ -41,20 +42,24 @@ class PConvLinearOptFunction(torch.autograd.Function):
                         weightnet, additional_features, linear_weights, linear_bias):
         neighbor_inds.requires_grad = False
 
+        # Match the dtypes
+        linear_weights_new_type = linear_weights.to(input_feat)
+        linear_bias_new_type = linear_bias.to(input_feat)
+
         output, pconv_output = pcf_cuda.pconv_linear_cutlass_forward(
             input_feat, neighbor_inds, weightnet, additional_features, 
-            linear_weights, linear_bias)
+            linear_weights_new_type, linear_bias_new_type)
 
         ctx.save_for_backward(input_feat, inverse_neighbors, inverse_k, inverse_idx, 
                             neighbor_inds, weightnet, additional_features, 
-                            linear_weights, pconv_output)
+                            linear_weights_new_type, linear_bias, pconv_output)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         saved = ctx.saved_tensors
         input_feat, inverse_neighbors, inverse_k, inverse_idx, neighbor_inds, \
-        weightnet, additional_features, linear_weights, pconv_output = saved
+        weightnet, additional_features, linear_weights, bias_type, pconv_output = saved
 
         grad_output = grad_output.contiguous()
 
@@ -63,7 +68,7 @@ class PConvLinearOptFunction(torch.autograd.Function):
             inverse_idx, neighbor_inds, weightnet, additional_features,
             linear_weights, pconv_output)
 
-        return grads[0], None, None, None, None, grads[1], grads[2], grads[3], grads[4]
+        return grads[0], None, None, None, None, grads[1], grads[2], grads[3].to(bias_type), grads[4].to(bias_type)
 
 # Wrapper for PConvLinearOptFunction
 class PConvLinearOpt(torch.nn.Module):

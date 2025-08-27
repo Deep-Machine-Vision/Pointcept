@@ -5,7 +5,6 @@
 
 #include "pcf.h"
 #include "knn.h"
-#include "pcf_ops.h"
 #include "pconv_ops.h"
 
 namespace pcf {
