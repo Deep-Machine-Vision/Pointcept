@@ -128,7 +128,6 @@ class PointConv_Encoder(PointModule):
             vi_features = None
             if self.USE_CUDA_KERNEL:
                 add_dim_neighbors = down_point.neighbors.unsqueeze(0)
-                print(down_point.coord.shape)
                 inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, down_point.coord.shape[0])
 
             for res_block in self.pointconv_res[i]:
