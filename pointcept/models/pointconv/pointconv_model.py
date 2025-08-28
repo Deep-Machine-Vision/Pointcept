@@ -1,11 +1,13 @@
 from pointcept.models.builder import MODELS
 from pointcept.models.utils.structure import Point
-from pointcept.models.utils.knn import compute_knn
+from pointcept.models.utils.knn import compute_knn_batched
 from pointcept.models.utils.sampling import grid_sampling
 from pointcept.models.modules import PointModule
 from .pointconv import PointLinearLayer, PointConvResBlock, PointConvTranspose
 import torch.nn as nn
 import torch
+
+import time
 
 try:
     import pcf_cuda
@@ -89,47 +91,97 @@ class PointConv_Encoder(PointModule):
         Returns:
             point_list (list): List of Point objects after each encoding stage with features of each point cloud level computed.
         """
+
+
+#        elapsed_time_layers = 0.0
+#        elapsed_time_knn = 0.0
+#        elapsed_time_inverse = 0.0
+#        torch.cuda.synchronize()
+#        start = time.time()
         point.coord = point.coord.float()
         
          # Initial embedding
         point.feat = self.embedding(point.feat)
 
         point_list = [point]
+#        torch.cuda.synchronize()
+#        end = time.time()
+
+#        elapsed_time = end - start
+#        elapsed_time_layers += elapsed_time
 
         if not hasattr(point, "neighbors") or len(point.neighbors) == 0:
-            point.neighbors = compute_knn(
-                point.coord, point.coord, K=self.enc_patch_size[0])
+#            torch.cuda.synchronize()
+#            start = time.time()
+            point.neighbors = compute_knn_batched(
+                point.coord, point.coord, point.offset, point.offset, K=self.enc_patch_size[0])
+#            torch.cuda.synchronize()
+#            end = time.time()
+#            elapsed_time = end - start
+#            elapsed_time_knn += elapsed_time
 
 
         for i, pointconv in enumerate(self.pointconv):
-            # Downsampling (stride-2) PointConv
+            # Downsampling (stride-2) PointConv            
             down_point = grid_sampling(point, reduce='mean')
-            down_point.neighbors = compute_knn(
-                down_point.coord, down_point.coord, K=self.enc_patch_size[i + 1])
+#            torch.cuda.synchronize()
+#            start = time.time()
+            down_point.neighbors = compute_knn_batched(
+                down_point.coord, down_point.coord, down_point.offset, down_point.offset, K=self.enc_patch_size[i + 1])
             if not hasattr(point, "neighbors_down") or len(point.neighbors_down) == 0:
-                point.neighbors_down = compute_knn(
-                    point.coord, down_point.coord, K=self.enc_patch_size[i])
+                point.neighbors_down = compute_knn_batched(
+                    point.coord, down_point.coord, point.offset, down_point.offset, K=self.enc_patch_size[i])
+#            torch.cuda.synchronize()
+#            end = time.time()
+#            elapsed_time = end - start
+#            elapsed_time_knn += elapsed_time
             if self.USE_CUDA_KERNEL:
+#                torch.cuda.synchronize()
+#                start = time.time()
                 add_dim_neighbors = point.neighbors_down.unsqueeze(0)
                 inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, point.coord.shape[0])
+#                torch.cuda.synchronize()
+#                end = time.time()
+#                elapsed_time = end - start
+#                elapsed_time_inverse += elapsed_time
                 inv_fwd_args = {
                                     "inv_neighbors": inv_n,
                                     "inv_k": inv_k,
                                     "inv_idx": inv_idx
                                 }
+#                torch.cuda.synchronize()
+#                start = time.time()
                 down_point.feat, _ = pointconv(
                     point.coord, point.feat, point.neighbors_down, point.normal, down_point.coord, down_point.normal, **inv_fwd_args)
+#                torch.cuda.synchronize()
+#                end = time.time()
+#                elapsed_time = end - start
+#                elapsed_time_layers += elapsed_time
             else:
+#                torch.cuda.synchronize()
+#                start = time.time()
                 down_point.feat, _ = pointconv(
                     point.coord, point.feat, point.neighbors_down, point.normal, down_point.coord, down_point.normal)
+#                torch.cuda.synchronize()
+#                end = time.time()
+#                elapsed_time = end - start
+#                elapsed_time_layers += elapsed_time
             # print(sparse_feat.shape)
             # There is the need to recompute VI features from the neighbors at this level rather than from the previous level, hence need
             # to recompute VI features in the first residual block
             vi_features = None
             if self.USE_CUDA_KERNEL:
+#                torch.cuda.synchronize()
+#                start = time.time()
                 add_dim_neighbors = down_point.neighbors.unsqueeze(0)
                 inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, down_point.coord.shape[0])
+#                torch.cuda.synchronize()
+#                end = time.time()
+#                elapsed_time = end - start
+#                elapsed_time_inverse += elapsed_time
 
+#            torch.cuda.synchronize()
+#            start = time.time()
             for res_block in self.pointconv_res[i]:
                 inv_self_args = {}
                 if self.USE_CUDA_KERNEL:
@@ -146,7 +198,12 @@ class PointConv_Encoder(PointModule):
                         down_point.coord, down_point.feat, down_point.neighbors, down_point.normal, **inv_self_args)
             point_list.append(down_point)
             point = down_point
+#            torch.cuda.synchronize()
+#            end = time.time()
+#            elapsed_time = end - start
+#            elapsed_time_layers += elapsed_time
 
+#        print(f"Time: Layers: {elapsed_time_layers}; kNN: {elapsed_time_knn}; Inverse: {elapsed_time_inverse}")
         return point_list
 
 @MODELS.register_module("PointConvDecoder")
@@ -230,8 +287,8 @@ class PointConv_Decoder(PointModule):
             up_point = point_list[len(point_list) - i - 2]
             # Upsampling (stride-2) PointConvTranspose
             if not hasattr(point, "neighbors_up") or point.neighbors_up is None or len(point.neighbors_up) == 0:
-                point.neighbors_up = compute_knn(
-                    point.coord, up_point.coord, K=self.dec_patch_size[len(self.dec_patch_size) - i - 1])
+                point.neighbors_up = compute_knn_batched(
+                    point.coord, up_point.coord, point.offset, up_point.offset, K=self.dec_patch_size[len(self.dec_patch_size) - i - 1])
             if self.USE_CUDA_KERNEL:
                 add_dim_neighbors = point.neighbors_up.unsqueeze(0)
                 inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, up_point.coord.shape[0])

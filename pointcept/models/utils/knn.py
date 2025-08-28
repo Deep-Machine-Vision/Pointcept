@@ -97,3 +97,80 @@ def compute_knn(ref_points, query_points, K, dilated_rate=1, method='cuvs_brute_
     if method == 'keops':
         assert isinstance(neighbors_idx, torch.Tensor), "neighbors_idx is not a torch.Tensor"
     return neighbors_idx
+
+def compute_knn_batched(
+    ref_points,
+    query_points,
+    batch_offset_ref,
+    batch_offset_query,
+    K,
+    dilated_rate=1,
+    method='cuvs_brute_force',
+    return_local_index=False,
+):
+    """
+    Batched KNN over contiguous blocks in `points`:
+      - Block 0: points[0:N1] queries neighbors within points[0:N1]
+      - Block 1: points[N1:N1+N2] within the same block
+      - ...
+    Args:
+        ref_points: (M x D) reference points
+        query_points: (N x D) query points
+        batch_offset_ref: iterable of ints [M1, M2, ..., MB] which indicates the start of each reference point cloud
+        batch_offset_query: iterable of ints [N1, N2, ..., NB] with indicates the start of each query point cloud
+        K: neighbors per query
+        dilated_rate: passed through to compute_knn
+        method: 'sklearn' | 'keops' | 'cuvs_brute_force'
+        return_local_index: if True, indices are 0..(Ni-1) within each block;
+                            if False (default), indices are global 0..(N-1)
+    Returns:
+        neighbors_idx_all: (N x K) indices (torch.Tensor if `points` is torch.Tensor, else np.ndarray)
+    """
+    import numpy as np
+    import torch
+
+    # Figure out return type / device
+    is_torch = isinstance(query_points, torch.Tensor)
+    device = query_points.device if is_torch else None
+
+    M = ref_points.shape[0]
+    N = query_points.shape[0]
+    # Container for each block's indices
+    block_inds = []
+
+    for i in range(len(batch_offset_query)):
+        if i>0:
+            pts_i_ref = ref_points[batch_offset_ref[i-1]:batch_offset_ref[i]]
+            pts_i_query = query_points[batch_offset_query[i-1]:batch_offset_query[i]]  # (Ni x D)
+        else:
+            pts_i_ref = ref_points[:batch_offset_ref[i]]
+            pts_i_query = query_points[:batch_offset_query[i]] 
+
+        inds_i = compute_knn(
+            pts_i_ref, pts_i_query, K,
+            dilated_rate=dilated_rate,
+            method=method
+        )
+
+        # Convert to torch on right device if needed
+        if is_torch and not isinstance(inds_i, torch.Tensor):
+            inds_i = torch.as_tensor(inds_i, device=device)
+        elif (not is_torch) and isinstance(inds_i, torch.Tensor):
+            inds_i = inds_i.cpu().numpy()
+
+        # Map local→global if requested
+        if not return_local_index and i > 0:
+            if is_torch:
+                inds_i = inds_i + batch_offset_ref[i-1]
+            else:
+                inds_i = inds_i + batch_offset_ref[i-1]
+
+        block_inds.append(inds_i)
+
+    # Concatenate along the query dimension (N x K)
+    if is_torch:
+        neighbors_idx_all = torch.cat(block_inds, dim=0)
+    else:
+        neighbors_idx_all = np.concatenate(block_inds, axis=0)
+
+    return neighbors_idx_all
