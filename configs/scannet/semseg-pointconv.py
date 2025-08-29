@@ -1,7 +1,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 8 # bs: total bs in all gpus
+batch_size = 6 # bs: total bs in all gpus
 num_worker = 20
 mix_prob = 0.8
 empty_cache = False
@@ -15,7 +15,7 @@ model = dict(
     backbone=dict(
         type="PointConvUNet",
         in_channels=6,
-        enc_depths=(2,2,2,6,2),
+        enc_depths=(0,2,2,6,2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_patch_size=(16,16,16,16,16),
         dec_depths=(0,0,0,0,0),
@@ -36,7 +36,8 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 800
+epoch = 300
+eval_epoch = 300
 optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.0001)
 scheduler = dict(
     type="OneCycleLR",

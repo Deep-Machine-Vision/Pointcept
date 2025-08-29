@@ -184,8 +184,7 @@ class PointConvResBlock(nn.Module):
             if self.norm_layer == 'bn':
                 self.norm_layer = PermutedBN(out_channel // 2, momentum=0.1)
         else: 
-            # we would have to do normalization separately because the CUDA kernel doesn't have normalization built in it
-            self.linear = PointLinearLayer((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2, norm_layer=None, act_layer=None, bn_ver = '1d')
+            self.linear = PointLinearLayer((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2, norm_layer=norm_layer, act_layer=None, bn_ver = '1d')
 
         self.dropout = nn.Dropout(
             p=drop_out_rate) if drop_out_rate > 0. else nn.Identity()
@@ -598,7 +597,7 @@ class PointConvTranspose(nn.Module):
             if self.norm_layer == 'bn':
                 self.norm_layer = PermutedBN(out_channel, momentum=0.1)
         else:
-            self.linear = nn.Linear((last_ch + in_channel) * weightnet[-1], out_channel)
+            self.linear = PointLinearLayer((last_ch + in_channel) * weightnet[-1], out_channel, norm_layer=norm_layer, act_layer=None, bn_ver = '1d')
                 # self.linear = Linear_BN(
                 #                 (last_ch + out_channel) * weightnet[-1], out_channel, bn_ver='1d')
     #            self.linear = nn.Linear(
