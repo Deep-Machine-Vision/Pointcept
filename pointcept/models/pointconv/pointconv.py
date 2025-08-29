@@ -26,11 +26,12 @@ class PointLinearLayer(nn.Module):
             if norm_layer and not callable(norm_layer):
                 raise AssertionError("norm_layer must be 'bn' or a function pointer")
             self.linear = nn.Linear(in_channels, out_channels)
+            self.norm = norm_layer(out_channels)
 
     def forward(self, x):
         x = self.linear(x)
         if callable(self.norm_layer):
-            x = self.norm_layer(x)
+            x = self.norm(x)
         if callable(self.act_layer):
             x = self.act_layer(x)
         return x
@@ -148,7 +149,7 @@ class PointConvResBlock(nn.Module):
                  USE_VI = True,
                  USE_CUDA_KERNEL = True,
                  weightnet=[9, 16], 
-                 norm_layer = 'bn',
+                 norm_layer = torch.nn.LayerNorm,
                  act_layer = torch.nn.LeakyReLU(0.1,inplace=True),
                  drop_out_rate = 0.0, 
                  drop_path_rate=0.0):
@@ -182,9 +183,10 @@ class PointConvResBlock(nn.Module):
             self.pconv_linear_opt = PConvLinearOpt((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2)
             # need to customly do BN without the fusion as of this CUDA kernel
             if self.norm_layer == 'bn':
-                self.norm_layer = PermutedBN(out_channel // 2, momentum=0.1)
+                self.norm = PermutedBN(out_channel // 2, momentum=0.1)
         else: 
             self.linear = PointLinearLayer((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2, norm_layer=norm_layer, act_layer=None, bn_ver = '1d')
+            self.norm = self.norm_layer(out_channel // 2)
 
         self.dropout = nn.Dropout(
             p=drop_out_rate) if drop_out_rate > 0. else nn.Identity()
@@ -304,7 +306,7 @@ class PointConvResBlock(nn.Module):
         if not self.USE_CUDA_KERNEL:
             new_feat = self.linear(new_feat)
         if callable(self.norm_layer):
-            new_feat = self.norm_layer(new_feat)
+            new_feat = self.norm(new_feat)
 
         # Dropout
         new_feat = self.dropout(new_feat)
@@ -363,7 +365,7 @@ class PointConvSimple(nn.Module):
             in_channel,
             out_channel,
             weightnet=[9, 16],
-            norm_layer = 'bn',
+            norm_layer = torch.nn.LayerNorm,
             act_layer = torch.nn.ReLU(inplace=True),
             USE_VI=False,
             USE_PE=False,
@@ -388,11 +390,11 @@ class PointConvSimple(nn.Module):
         self.weightnet = WeightNet(weightnet[0], weightnet[1], efficient=True)
 
         if norm_layer == 'bn':
-            self.norm_layer = PermutedBN(out_channel)
+            self.norm = PermutedBN(out_channel)
         elif callable(norm_layer):
-            self.norm_layer = norm_layer
+            self.norm = norm_layer(out_channel)
         else:
-            self.norm_layer = None
+            self.norm = None
 
         if self.USE_CUDA_KERNEL:
             self.pconv_linear_opt = PConvLinearOpt(last_ch * weightnet[-1], out_channel)
@@ -509,7 +511,7 @@ class PointConvSimple(nn.Module):
             new_feat = self.linear(new_feat)
 
         if callable(self.norm_layer):
-            new_feat = self.norm_layer(new_feat)
+            new_feat = self.norm(new_feat)
 
         # new_feat = F.relu(new_feat, inplace=True)
         new_feat = self.act_layer(new_feat)
@@ -559,7 +561,7 @@ class PointConvTranspose(nn.Module):
             weightnet=[9, 16],
             dropout_rate = 0.0,
             drop_path_rate=0.0,
-            norm_layer = 'bn',
+            norm_layer = torch.nn.LayerNorm,
             USE_PE = True,
             USE_VI = True,
             USE_CUDA_KERNEL = True,
@@ -595,9 +597,10 @@ class PointConvTranspose(nn.Module):
         if self.USE_CUDA_KERNEL:
             self.pconv_linear_opt = PConvLinearOpt((last_ch + in_channel) * weightnet[-1], out_channel)
             if self.norm_layer == 'bn':
-                self.norm_layer = PermutedBN(out_channel, momentum=0.1)
+                self.norm = PermutedBN(out_channel, momentum=0.1)
         else:
             self.linear = PointLinearLayer((last_ch + in_channel) * weightnet[-1], out_channel, norm_layer=norm_layer, act_layer=None, bn_ver = '1d')
+            self.norm = norm_layer(out_channel)
                 # self.linear = Linear_BN(
                 #                 (last_ch + out_channel) * weightnet[-1], out_channel, bn_ver='1d')
     #            self.linear = nn.Linear(
@@ -712,7 +715,7 @@ class PointConvTranspose(nn.Module):
             new_feat = self.linear(new_feat)
 
         if callable(self.norm_layer):
-            new_feat = self.norm_layer(new_feat)
+            new_feat = self.norm(new_feat)
 
         new_feat = F.relu(new_feat, inplace=True)
 
