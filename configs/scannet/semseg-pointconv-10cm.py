@@ -15,7 +15,7 @@ model = dict(
     backbone=dict(
         type="PointConvUNet",
         in_channels=6,
-        enc_depths=(0,2,2,6,2),
+        enc_depths=(0,3,3,3,3),
         enc_channels=(32, 64, 128, 256, 512),
         enc_patch_size=(16,16,16,16,16),
         dec_depths=(0,0,0,0,0),
@@ -25,7 +25,6 @@ model = dict(
         USE_VI = True,
         USE_CUDA_KERNEL = False,
         weightnet_middim = [4,4,4,4,4],
-        norm_layer = 'bn',
         drop_out_rate = 0.0,
         drop_path_rate = 0.0,
     ),
@@ -38,7 +37,7 @@ model = dict(
 # scheduler settings
 epoch = 300
 eval_epoch = 300
-optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.0)
+optimizer = dict(type="AdamW", lr=0.01, weight_decay=0.0)
 scheduler = dict(
     type="MultiStepLR",
     # milestones need to be w.r.t. the full training length
@@ -294,3 +293,15 @@ data = dict(
 #        ),
 #    ),
 )
+
+
+# hook
+hooks = [
+    dict(type="CheckpointLoader"),
+    dict(type="ModelHook"),
+    dict(type="IterationTimer", warmup_iter=2),
+    dict(type="InformationWriter"),
+    dict(type="SemSegEvaluator"),
+    dict(type="CheckpointSaver", save_freq=5),
+    dict(type="PreciseEvaluator", test_last=False),
+]

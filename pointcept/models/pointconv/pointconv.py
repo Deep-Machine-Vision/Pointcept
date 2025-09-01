@@ -179,14 +179,16 @@ class PointConvResBlock(nn.Module):
             self.unary1 = nn.Identity()
 
         self.weightnet = WeightNet(weightnet[0], weightnet[1], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
+        self.norm = None
         if self.USE_CUDA_KERNEL:
             self.pconv_linear_opt = PConvLinearOpt((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2)
             # need to customly do BN without the fusion as of this CUDA kernel
             if self.norm_layer == 'bn':
                 self.norm = PermutedBN(out_channel // 2, momentum=0.1)
-        else: 
+            elif callable(norm_layer):
+                self.norm = self.norm_layer(out_channel // 2)
+        else:
             self.linear = PointLinearLayer((out_channel // 4 + last_ch) * weightnet[-1], out_channel // 2, norm_layer=norm_layer, act_layer=None, bn_ver = '1d')
-            self.norm = self.norm_layer(out_channel // 2)
 
         self.dropout = nn.Dropout(
             p=drop_out_rate) if drop_out_rate > 0. else nn.Identity()
@@ -305,7 +307,8 @@ class PointConvResBlock(nn.Module):
         # In the fused CUDA kernel, we have already done the linear layer
         if not self.USE_CUDA_KERNEL:
             new_feat = self.linear(new_feat)
-        if callable(self.norm_layer):
+        # If we use CUDA kernel then we need to append a normalization layer
+        if self.norm:
             new_feat = self.norm(new_feat)
 
         # Dropout
@@ -594,13 +597,15 @@ class PointConvTranspose(nn.Module):
 
         self.weightnet = WeightNet(weightnet[0], weightnet[1], efficient=True)
 
+        self.norm = None
         if self.USE_CUDA_KERNEL:
             self.pconv_linear_opt = PConvLinearOpt((last_ch + in_channel) * weightnet[-1], out_channel)
             if self.norm_layer == 'bn':
                 self.norm = PermutedBN(out_channel, momentum=0.1)
+            elif callable(self.norm_layer):
+                self.norm = norm_layer(out_channel)
         else:
             self.linear = PointLinearLayer((last_ch + in_channel) * weightnet[-1], out_channel, norm_layer=norm_layer, act_layer=None, bn_ver = '1d')
-            self.norm = norm_layer(out_channel)
                 # self.linear = Linear_BN(
                 #                 (last_ch + out_channel) * weightnet[-1], out_channel, bn_ver='1d')
     #            self.linear = nn.Linear(
@@ -714,7 +719,7 @@ class PointConvTranspose(nn.Module):
                 B, M, -1)
             new_feat = self.linear(new_feat)
 
-        if callable(self.norm_layer):
+        if self.norm:
             new_feat = self.norm(new_feat)
 
         new_feat = F.relu(new_feat, inplace=True)
