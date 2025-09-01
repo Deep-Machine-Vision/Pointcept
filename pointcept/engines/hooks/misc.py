@@ -193,9 +193,10 @@ class CheckpointSaver(HookBase):
             filename = os.path.join(
                 self.trainer.cfg.save_path, "model", "model_last.pth"
             )
-            self.trainer.logger.info("Saving checkpoint to: " + filename)
-            torch.save(
-                {
+            if is_best or (self.save_freq == None) or (self.save_freq and (self.trainer.epoch + 1) % self.save_freq == 0):
+                self.trainer.logger.info("Saving checkpoint to: " + filename)
+                torch.save(
+                    {
                     "epoch": self.trainer.epoch + 1,
                     "state_dict": self.trainer.model.state_dict(),
                     "optimizer": self.trainer.optimizer.state_dict(),
@@ -208,8 +209,8 @@ class CheckpointSaver(HookBase):
                     "best_metric_value": self.trainer.best_metric_value,
                 },
                 filename + ".tmp",
-            )
-            os.replace(filename + ".tmp", filename)
+                )
+                os.replace(filename + ".tmp", filename)
             if is_best:
                 shutil.copyfile(
                     filename,

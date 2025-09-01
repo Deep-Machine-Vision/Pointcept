@@ -41,7 +41,7 @@ optimizer = dict(type="AdamW", lr=0.01, weight_decay=0.0)
 scheduler = dict(
     type="MultiStepLR",
     # milestones need to be w.r.t. the full training length
-    milestones = [0.25,0.45,0.6,0.8, 0.9],
+    milestones = [0.25,0.45,0.6,0.75, 0.9],
     gamma = 0.5,
 )
 param_dicts = [dict(keyword="block", lr=0.01)]
