@@ -380,7 +380,9 @@ class PointConvSimple(nn.Module):
 
         self.USE_VI = USE_VI
         self.USE_PE = USE_PE
+        self.USE_CUDA_KERNEL = USE_CUDA_KERNEL
         self.act_layer = act_layer
+        self.norm_layer =  norm_layer
         last_ch = in_channel
         if USE_PE:
             if self.USE_VI:
@@ -551,6 +553,7 @@ class PointConvTranspose(nn.Module):
         dense_feats: shortcut dense features
         vi_features: tensor (batch_size, num_points2, 12). VI features only needs to be computed once per stage. If it 
                      has been computed in a previous layer, it can be saved and directly inputted here.
+        mlp2: Add MLP layers at the end -- this can be used instead of convolution layers in the decoder to speed things up
         Note: batch_size is usually 1 since we are using the packed representation packing multiple point clouds into 
               one. However this dimension needs to be there for pyTorch to work properly.
     Output:
@@ -565,6 +568,7 @@ class PointConvTranspose(nn.Module):
             dropout_rate = 0.0,
             drop_path_rate=0.0,
             norm_layer = torch.nn.LayerNorm,
+            act_layer = torch.nn.LeakyReLU(0.1, inplace=True),
             USE_PE = True,
             USE_VI = True,
             USE_CUDA_KERNEL = True,
@@ -576,6 +580,7 @@ class PointConvTranspose(nn.Module):
         self.USE_VI = USE_VI
         self.USE_CUDA_KERNEL = USE_CUDA_KERNEL
         self.norm_layer = norm_layer
+        self.act_layer = act_layer
 
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
 # This part can save a bit of memory, maybe with some performance drop or maybe no drop at all
@@ -605,7 +610,7 @@ class PointConvTranspose(nn.Module):
             elif callable(self.norm_layer):
                 self.norm = norm_layer(out_channel)
         else:
-            self.linear = PointLinearLayer((last_ch + in_channel) * weightnet[-1], out_channel, norm_layer=norm_layer, act_layer=None, bn_ver = '1d')
+            self.linear = PointLinearLayer((last_ch + in_channel) * weightnet[-1], out_channel, norm_layer=norm_layer, act_layer=act_layer, bn_ver = '1d')
                 # self.linear = Linear_BN(
                 #                 (last_ch + out_channel) * weightnet[-1], out_channel, bn_ver='1d')
     #            self.linear = nn.Linear(
@@ -617,11 +622,8 @@ class PointConvTranspose(nn.Module):
         self.mlp2_convs = nn.ModuleList()
         if mlp2 is not None:
             for i in range(1, len(mlp2)):
-                if self.norm_layer == 'bn':
-                    self.mlp2_convs.append(
-                        Linear_BN(mlp2[i - 1], mlp2[i], bn_ver='1d'))
-                else:
-                    self.mlp2_convs.append(nn.Linear(mlp2[i - 1], mlp2[i]))
+                self.mlp2_convs.append(
+                    PointLinearLayer(mlp2[i - 1], mlp2[i], norm_layer = norm_layer, act_layer = act_layer, bn_ver = '1d'))
 
     def forward(
             self,
@@ -721,8 +723,7 @@ class PointConvTranspose(nn.Module):
 
         if self.norm:
             new_feat = self.norm(new_feat)
-
-        new_feat = F.relu(new_feat, inplace=True)
+            new_feat = self.act_layer(new_feat)
 
         if dense_feats is not None:
             new_feat = new_feat + dense_feats
@@ -731,7 +732,7 @@ class PointConvTranspose(nn.Module):
         new_feat = self.dropout(new_feat)
 
         for conv in self.mlp2_convs:
-            new_feat = F.relu(conv(new_feat), inplace=True)
+            new_feat = conv(new_feat)
 
         if no_batch is True:
             new_feat = new_feat.squeeze(0)

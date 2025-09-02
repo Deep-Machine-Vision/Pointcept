@@ -3,7 +3,7 @@ from pointcept.models.utils.structure import Point
 from pointcept.models.utils.knn import compute_knn_batched
 from pointcept.models.utils.sampling import grid_sampling
 from pointcept.models.modules import PointModule
-from .pointconv import PointLinearLayer, PointConvResBlock, PointConvTranspose
+from .pointconv import PointLinearLayer, PointConvResBlock, PointConvTranspose, PointConvSimple
 import torch.nn as nn
 import torch
 
@@ -55,12 +55,23 @@ class PointConv_Encoder(PointModule):
             weightnet_input_dim = point_dim
         weightnet = [weightnet_input_dim, weightnet_middim[0]]  # 2 hidden layers
 
-        self.embedding = PointLinearLayer(
-            in_channels=in_channels,
-            out_channels=enc_channels[0],
-            norm_layer=norm_layer,
-            act_layer=act_layer, bn_ver='1d'
-        )
+
+        self.embedding_res_blocks = None
+        if enc_depths[0] > 0:
+            self.embedding_res_blocks = nn.ModuleList()
+            self.embedding = PointConvSimple(in_channels, enc_channels[0],weightnet, norm_layer, act_layer, USE_VI, USE_PE, USE_CUDA_KERNEL, drop_out_rate)
+            for _ in range(enc_depths[0]-1):
+                self.embedding_res_blocks.append(
+                            PointConvResBlock(
+                                enc_channels[0], enc_channels[0], USE_VI, self.USE_CUDA_KERNEL, weightnet, norm_layer, act_layer))
+
+        else:
+            self.embedding = PointLinearLayer(
+                in_channels=in_channels,
+                out_channels=enc_channels[0],
+                norm_layer=norm_layer,
+                act_layer=act_layer, bn_ver='1d'
+            )
         self.pointconv = nn.ModuleList()
         self.pointconv_res = nn.ModuleList()
 
@@ -100,8 +111,28 @@ class PointConv_Encoder(PointModule):
         start = time.time()
         point.coord = point.coord.float()
         
-         # Initial embedding
-        point.feat = self.embedding(point.feat)
+         # Initial embedding, PointConv or MLP
+        if self.embedding_res_blocks:
+            with torch.no_grad():
+                if not hasattr(point,"neighbors") or len(point.neighbors)==0:
+                    point.neighbors = compute_knn_batched(
+                        point.coord, point.coord, point.offset, point.offset, K=self.enc_patch_size[0])
+                inv_self_args = {}
+                if self.USE_CUDA_KERNEL:
+                    add_dim_neighbors = point.neighbors.unsqueeze(0)
+                    inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, point.coord.shape[0])
+                    inv_self_args = {
+                                        "inv_neighbors": inv_n,
+                                        "inv_k": inv_k,
+                                        "inv_idx": inv_idx
+                                    }
+            point.feat, vi_features = self.embedding(point.coord, point.feat, point.neighbors, point.normal, **inv_self_args)
+
+            for res_block in self.embedding_res_blocks:
+                point.feat, _ = res_block(
+                    point.coord, point.feat, point.neighbors, point.normal, vi_features=vi_features, **inv_self_args)
+        else:
+            point.feat = self.embedding(point.feat)
 
         point_list = [point]
         torch.cuda.synchronize()
@@ -211,6 +242,7 @@ class PointConv_Decoder(PointModule):
                  weightnet_middim=[4, 4, 4, 4],
                  act_layer=torch.nn.LeakyReLU(0.1, inplace=True),
                  norm_layer='bn', 
+                 mlp_layers = True, # Append MLP in the decoder (can be used instead of convolution to speed-up the decoder)
                  drop_out_rate=0.0, 
                  drop_path_rate=0.0
                  ):
@@ -235,6 +267,10 @@ class PointConv_Decoder(PointModule):
             in_ch = dec_channels[i]
             out_ch = dec_channels[i - 1]
             weightnet = [weightnet_input_dim, weightnet_middim[i-1]]
+            if mlp_layers:
+                mlp2 = [out_ch, out_ch]
+            else:
+                mlp2 = None
             # Upsampling PointConvTranspose
             self.pointconv_transpose.append(
                 PointConvTranspose(in_ch, out_ch, weightnet, 
@@ -243,7 +279,8 @@ class PointConv_Decoder(PointModule):
                                     norm_layer = norm_layer,
                                     USE_PE = True,
                                     USE_VI = USE_VI,
-                                    USE_CUDA_KERNEL = self.USE_CUDA_KERNEL
+                                    USE_CUDA_KERNEL = self.USE_CUDA_KERNEL,
+                                    mlp2 = mlp2
                 )
             )
             if dec_depths[i - 1] == 0:

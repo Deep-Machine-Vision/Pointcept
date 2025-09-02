@@ -15,12 +15,13 @@ model = dict(
     backbone=dict(
         type="PointConvUNet",
         in_channels=6,
-        enc_depths=(0,3,3,3,3),
+        enc_depths=(3,3,3,3,3),
         enc_channels=(32, 64, 128, 256, 512),
         enc_patch_size=(16,16,16,16,16),
         dec_depths=(0,0,0,0,0),
         dec_channels=(32,64,128,256,512),
         dec_patch_size=(16,16,16,16,16),
+        norm_layer = 'bn',
         USE_PE = True,
         USE_VI = True,
         USE_CUDA_KERNEL = False,
@@ -44,7 +45,6 @@ scheduler = dict(
     milestones = [0.25,0.45,0.6,0.75, 0.9],
     gamma = 0.5,
 )
-param_dicts = [dict(keyword="block", lr=0.01)]
 
 # dataset settings
 dataset_type = "ScanNetDataset"
@@ -108,7 +108,7 @@ data = dict(
             dict(type="SphereCrop", point_max=102400, mode="random"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
-            # dict(type="ShufflePoint"),
+            dict(type="ShufflePoint"),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
