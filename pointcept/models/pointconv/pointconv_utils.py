@@ -311,3 +311,36 @@ def replace_bn_layers(module: torch.nn.Module, verbose: bool = True):
             raise RuntimeError(f"Failed to fuse {module}: {e}") from e
 
     return module, fused_count
+
+class PointLayerNorm:
+    def __init__(self, channels, eps=1e-5, elementwise_affine=True, bias = True):
+        """
+        Applies Layer Normalization for packed representation of point clouds
+        as described in the paper Layer Normalization (https://arxiv.org/abs/1607.06450)
+        Input:
+            x: input points data, shape [B, N, C]
+        Return:
+            normalized points data, shape [B, N, C]
+        """
+        self.eps = eps
+        self.channels = channels
+        self.elementwise_affine = elementwise_affine
+        self.bias = bias
+        if elementwise_affine:
+            self.weight = torch.nn.Parameter(torch.ones(channels))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.zeros(channels))
+    def forward(self, x, batch_indices):
+        from torch_scatter import segment_csr
+        mean_x = segment_csr(x, batch_indices, reduce='mean')
+        std_x = torch.sqrt(segment_csr((x - mean_x[batch_indices])**2, batch_indices, reduce='mean') + self.eps)
+        if self.elementwise_affine:
+            if self.bias:
+                return (x - mean_x[batch_indices]) / std_x[batch_indices] * self.weight + self.bias
+            else:
+                return (x - mean_x[batch_indices]) / std_x[batch_indices] * self.weight
+        else:
+            if self.bias:
+                return (x - mean_x[batch_indices]) / std_x[batch_indices] + self.bias
+            else:
+                return (x - mean_x[batch_indices]) / std_x[batch_indices]
