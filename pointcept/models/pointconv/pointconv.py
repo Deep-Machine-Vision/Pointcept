@@ -22,11 +22,11 @@ class PointLinearLayer(nn.Module):
         if norm_layer == 'bn':
             self.linear = Linear_BN(in_channels, out_channels, bn_ver)
         else:
-            # norm_layer can also be None, then there is no normalization
             if norm_layer and not callable(norm_layer):
                 raise AssertionError("norm_layer must be 'bn' or a function pointer")
             self.linear = nn.Linear(in_channels, out_channels)
-            self.norm = norm_layer(out_channels)
+            if callable(norm_layer):
+                self.norm = norm_layer(out_channels)
 
     def forward(self, x):
         x = self.linear(x)
@@ -62,7 +62,7 @@ class WeightNet(nn.Module):
             self,
             in_channel,
             out_channel,
-            hidden_unit=[8, 8],
+            hidden_unit=[16,16],
             norm_layer = 'bn',
             act_layer = torch.nn.ReLU(inplace=True),
             efficient=False):
@@ -80,9 +80,8 @@ class WeightNet(nn.Module):
             self.mlp_convs.append(PointLinearLayer(in_channel, hidden_unit[0], norm_layer=norm_layer, act_layer=act_layer))
             for i in range(1, len(hidden_unit)):
                 self.mlp_convs.append(
-                    PointLinearLayer(hidden_unit[i - 1], hidden_unit[i], norm_layer=norm_layer))
-                # TODO: Copilot suggested to remove the last norm layer, maybe try it at some point
-            self.mlp_convs.append(PointLinearLayer(hidden_unit[-1], out_channel, norm_layer=norm_layer,act_layer = act_layer))
+                    PointLinearLayer(hidden_unit[i - 1], hidden_unit[i], norm_layer=norm_layer, act_layer = act_layer))
+            self.mlp_convs.append(PointLinearLayer(hidden_unit[-1], out_channel, norm_layer=norm_layer,act_layer = None))
 
     def real_forward(self, localized_xyz):
         # xyz : BxNxKxC
@@ -110,21 +109,22 @@ class WeightNet(nn.Module):
             args = [localized_xyz + dummy]
             if self.training:
                 for conv in self.mlp_convs:
-                    args += tuple(conv.linear.bn.parameters())
-                    args += tuple(conv.linear.c.parameters())
+                    if hasattr(conv.linear,'bn'):
+                        args += tuple(conv.linear.bn.parameters())
+                        args += tuple(conv.linear.c.parameters())
                 weights = CheckpointFunction.apply(conv_bn_relu, 1, *args)
         elif self.efficient and self.training:
             # Use gradient checkpointing for memory efficiency. WeightNet can be
             # very inefficient during training if checkpointing is not used
-            weights = checkpoint.checkpoint(self.real_forward, localized_xyz)
+            weights = checkpoint.checkpoint(self.real_forward, localized_xyz,use_reentrant = True)
         else:
             weights = self.real_forward(localized_xyz)
         return weights
 
-class PointConvResBlock(nn.Module):
+class DepthWisePointConv(nn.Module):
     '''
     PointConv block with a positional embedding concatenated to the features
-    and a ResNet-style bottleneck structure and shortcut connections
+    and a ConvNeXt-style inverted bottleneck structure and shortcut connections
     Parameters:
         in_channel: Number of input channels
         out_channel: Number of output channels
@@ -147,7 +147,188 @@ class PointConvResBlock(nn.Module):
     '''
     def __init__(self, in_channel, out_channel, 
                  USE_VI = True,
-                 USE_CUDA_KERNEL = True,
+                 weightnet=[9, 16], 
+                 norm_layer = torch.nn.LayerNorm,
+                 act_layer = torch.nn.LeakyReLU(0.1,inplace=True),
+                 drop_out_rate = 0.0, 
+                 drop_path_rate=0.0):
+        super(DepthWisePointConv, self).__init__()
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.USE_VI = USE_VI
+
+        self.drop_path = DropPath(
+            drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+        self.act_layer = act_layer
+        self.norm_layer = norm_layer
+
+        # positonal encoder
+        self.pe_convs = WeightNet(
+            3, min(out_channel//2, 32), hidden_unit=[min(out_channel//2,32)], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
+        last_ch = min(out_channel//2, 32)
+
+        # For depthwise convolution, we just use weightnet to compute weights
+        
+        # TO-REVERT: Just try bn in the weightnet
+
+        #self.weightnet = WeightNet(weightnet[0], in_channel, norm_layer = norm_layer, act_layer = act_layer, efficient=True)
+        self.weightnet = WeightNet(weightnet[0], in_channel, norm_layer = 'bn', act_layer = act_layer, efficient=True)
+        if callable(norm_layer):
+            self.norm = norm_layer(in_channel + last_ch)
+        elif norm_layer == 'bn':
+            self.norm =  PermutedBN(in_channel + last_ch)
+        # Inverted bottleneck structure, first linear layer has no normalization
+        self.linear1 = PointLinearLayer(in_channel + last_ch, in_channel * 4, norm_layer=None, act_layer=act_layer)
+        # Second one has no normalization and no activation
+        self.linear2 = PointLinearLayer(in_channel * 4, out_channel, norm_layer = None, act_layer = None)
+
+        self.dropout = nn.Dropout(
+            p=drop_out_rate) if drop_out_rate > 0. else nn.Identity()
+        
+        # Shortcut optional mlp
+        if in_channel != out_channel:
+            self.unary_shortcut = PointLinearLayer(in_channel,out_channel,norm_layer = norm_layer, act_layer = None, bn_ver = '1d')
+        else:
+            self.unary_shortcut = nn.Identity()
+
+        return
+
+    def forward(
+            self,
+            dense_xyz,
+            dense_feats,
+            nei_inds,
+            dense_xyz_norm=None,
+            sparse_xyz=None,
+            sparse_xyz_norm=None,
+            vi_features=None,
+            inv_neighbors=None,
+            inv_k=None,
+            inv_idx=None):
+        """
+        dense_xyz: tensor (batch_size, num_points, 3)
+        sparse_xyz: tensor (batch_size, num_points2, 3), if None, then assume sparse_xyz = dense_xyz
+        dense_feats: tensor (batch_size, num_points, num_dims)
+        nei_inds: tensor (batch_size, num_points2, K)
+        dense_xyz_norm: tensor (batch_size, num_points, 3), used to compute VI features
+        sparse_xyz_norm: tensor (batch_size, num_points2, 3), only when sparse_xyz is used
+        vi_features: tensor (batch_size, num_points2, 12), if None, then compute VI features from dense_xyz_norm
+        inv_neighbors: tensor (batch_size, num_points2, K), inverse neighbors for the CUDA kernel
+        inv_k: tensor (batch_size, num_points2), inverse k for the CUDA kernel
+        inv_idx: tensor (batch_size, num_points2, K), inverse indices for the CUDA kernel
+        """
+        no_batch = False
+        # Deal with no batch dimension case
+        if dense_xyz.dim() == 2:
+            dense_xyz = dense_xyz.unsqueeze(0)
+        if sparse_xyz is not None and len(sparse_xyz) > 0 and sparse_xyz.dim() == 2:
+            sparse_xyz = sparse_xyz.unsqueeze(0)
+        if dense_feats.dim() == 2:
+            dense_feats = dense_feats.unsqueeze(0)
+            no_batch = True
+        if nei_inds.dim() == 2:
+            nei_inds = nei_inds.unsqueeze(0)
+        if dense_xyz_norm is not None and len(dense_xyz_norm) > 0 and dense_xyz_norm.dim() == 2:
+            dense_xyz_norm = dense_xyz_norm.unsqueeze(0)
+        if sparse_xyz_norm is not None and len(sparse_xyz_norm) > 0 and sparse_xyz_norm.dim() == 2:
+            sparse_xyz_norm = sparse_xyz_norm.unsqueeze(0)
+        if vi_features is not None and vi_features.dim() == 3:
+            vi_features = vi_features.unsqueeze(0)
+        B, N, _ = dense_xyz.shape
+        if sparse_xyz is not None:
+            _, M, _ = sparse_xyz.shape
+        else:
+            M = N
+        _, _, K = nei_inds.shape
+
+        gathered_xyz = index_points(dense_xyz, nei_inds)
+        # localized_xyz = gathered_xyz - sparse_xyz.view(B, M, 1, D) #[B, M, K,
+        # D]
+        if sparse_xyz is not None:
+            localized_xyz = gathered_xyz - sparse_xyz.unsqueeze(dim=2)
+        else:
+            localized_xyz = gathered_xyz - dense_xyz.unsqueeze(dim=2)
+
+        feat_pe = self.pe_convs(localized_xyz)  # [B, M, K, D]
+
+        if self.USE_VI is True:
+            if dense_xyz_norm is None or len(dense_xyz_norm) == 0:
+                raise AssertionError(
+                    "dense_xyz_norm must be provided for VI features")
+            gathered_norm = index_points(dense_xyz_norm, nei_inds)
+            if vi_features is None:
+                if sparse_xyz is not None:
+                    weightNetInput = VI_coordinate_transform(
+                        localized_xyz, gathered_norm, sparse_xyz_norm, K)
+                else:
+                    weightNetInput = VI_coordinate_transform(
+                        localized_xyz, gathered_norm, dense_xyz_norm, K)
+            else:
+                weightNetInput = vi_features
+        else:
+            weightNetInput = localized_xyz
+        # No CUDA kernel for this
+        gathered_feat = index_points(dense_feats, nei_inds)  # [B, M, K, in_ch]
+        weights = self.weightnet(weightNetInput)
+        # This is element-wise multiplication
+        new_feat = gathered_feat * weights
+
+        new_feat = torch.cat([new_feat, feat_pe], dim=-1)
+        # Sum out the neighborhood dimension
+        new_feat = new_feat.sum(dim = 2)
+        new_feat = self.norm(new_feat)
+
+        new_feat = self.linear2(self.linear1(new_feat))
+
+
+        # Dropout
+        new_feat = self.dropout(new_feat)
+
+        if sparse_xyz is not None:
+            sparse_feats = torch.max(
+                index_points(
+                    dense_feats,
+                    nei_inds),
+                dim=2)[0]
+        else:
+            sparse_feats = dense_feats
+
+        shortcut = self.unary_shortcut(sparse_feats)
+
+        new_feat = self.drop_path(new_feat) + shortcut
+
+        if no_batch:
+            new_feat = new_feat.squeeze(0)
+            weightNetInput = weightNetInput.squeeze(0)
+        return new_feat, weightNetInput
+
+class PointConvResBlock(nn.Module):
+   '''
+    PointConv block with a positional embedding concatenated to the features
+    and a ResNet-style bottleneck structure and shortcut connections
+    Parameters:
+        in_channel: Number of input channels
+        out_channel: Number of output channels
+        weightnet: Number of input/output channels for weightnet
+    Input:
+        dense_xyz: tensor (batch_size, num_points, 3). The coordinates of the points before subsampling (if it is a "strided" convolution wihch simultaneously subsamples the point cloud)
+        dense_feats: tensor (batch_size, num_points, num_dims). The features of the points before subsampling.
+        nei_inds: tensor (batch_size, num_points2, K). The neighborhood indices of the K nearest neighbors of each point (after subsampling). The indices should index into dense_xyz and dense_feats,
+                  as during subsampling features at new coordinates are aggregated from the points before subsampling
+        dense_xyz_norm: tensor (batch_size, num_points, 3). The surface normals of the points before subsampling
+        sparse_xyz: tensor (batch_size, num_points2, 3). The coordinates of the points after subsampling (if there is no subsampling, just input None for this and the next)
+        sparse_xyz_norm: tensor (batch_size, num_points2, 3). The surface normals of the points after subsampling
+        vi_features: tensor (batch_size, num_points2, 12). VI features only needs to be computed once per stage. If it has been computed in a previous layer,
+                     it can be saved and directly inputted here.
+        Note: batch_size is usually 1 since we are using the packed representation packing multiple point clouds into one. However this dimension needs to be there for pyTorch to work properly.
+    Output:
+        new_feat: output features
+        weightNetInput: the input to weightNet, which are relative coordinates
+                        or viewpoint-invariance aware transforms of it
+    '''
+   def __init__(self, in_channel, out_channel, 
+                 USE_VI = True,
+                 USE_CUDA_KERNEL = False,
                  weightnet=[9, 16], 
                  norm_layer = torch.nn.LayerNorm,
                  act_layer = torch.nn.LeakyReLU(0.1,inplace=True),
@@ -156,8 +337,8 @@ class PointConvResBlock(nn.Module):
         super(PointConvResBlock, self).__init__()
         self.in_channel = in_channel
         self.out_channel = out_channel
-        self.USE_CUDA_KERNEL = USE_CUDA_KERNEL
         self.USE_VI = USE_VI
+        self.USE_CUDA_KERNEL = USE_CUDA_KERNEL
 
         self.drop_path = DropPath(
             drop_path_rate) if drop_path_rate > 0. else nn.Identity()
@@ -169,15 +350,7 @@ class PointConvResBlock(nn.Module):
             3, min(out_channel // 4, 32), hidden_unit=[out_channel // 4], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
         last_ch = min(out_channel // 4, 32)
 
-        # First downscaling mlp
-        if in_channel != out_channel // 4:
-            self.unary1 = PointLinearLayer(
-                in_channel,
-                out_channel // 4,
-                norm_layer = norm_layer, bn_ver = '1d')
-        else:
-            self.unary1 = nn.Identity()
-
+        # WeightNet
         self.weightnet = WeightNet(weightnet[0], weightnet[1], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
         self.norm = None
         if self.USE_CUDA_KERNEL:
@@ -203,8 +376,7 @@ class PointConvResBlock(nn.Module):
             self.unary_shortcut = nn.Identity()
 
         return
-
-    def forward(
+   def forward(
             self,
             dense_xyz,
             dense_feats,
@@ -392,7 +564,7 @@ class PointConvSimple(nn.Module):
         else:
             last_ch = in_channel
 
-        self.weightnet = WeightNet(weightnet[0], weightnet[1], efficient=True)
+        self.weightnet = WeightNet(weightnet[0], weightnet[1], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
 
         if norm_layer == 'bn':
             self.norm = PermutedBN(out_channel)
@@ -594,13 +766,13 @@ class PointConvTranspose(nn.Module):
         self.pe_convs = nn.ModuleList()
         if self.USE_PE:
             self.pe_convs = WeightNet(
-                3, min(out_channel // 4, 32), hidden_unit=[out_channel // 4], efficient=True)
+                3, min(out_channel // 4, 32), hidden_unit=[out_channel // 4], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
             last_ch = min(out_channel // 4, 32)
         else:
             self.pe_convs = nn.ModuleList()
             last_ch = 0
 
-        self.weightnet = WeightNet(weightnet[0], weightnet[1], efficient=True)
+        self.weightnet = WeightNet(weightnet[0], weightnet[1], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
 
         self.norm = None
         if self.USE_CUDA_KERNEL:
