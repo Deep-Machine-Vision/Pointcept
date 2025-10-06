@@ -3,7 +3,8 @@ from pointcept.models.utils.structure import Point
 from pointcept.models.utils.knn import compute_knn_batched
 from pointcept.models.utils.sampling import grid_sampling
 from pointcept.models.modules import PointModule
-from .pointconv import PointLinearLayer, PointConvResBlock, PointConvTranspose, PointConvSimple
+from .pointconv import PointLinearLayer, PointConvResBlock, PointConvTranspose, PointConvSimple, DepthWisePointConv, WeightNet
+from .pointconv_utils import PointLayerNorm
 import torch.nn as nn
 import torch
 
@@ -27,6 +28,7 @@ class PointConv_Encoder(PointModule):
                  enc_depths = [2, 4, 6, 6, 2],
                  enc_channels=[32, 64, 128, 256, 512],
                  enc_patch_size = [16, 16, 16, 16, 16],
+                 USE_DEPTHWISE = True,
                  USE_PE=True, 
                  USE_VI=True, 
                  USE_CUDA_KERNEL=True,
@@ -45,6 +47,9 @@ class PointConv_Encoder(PointModule):
             self.USE_CUDA_KERNEL = USE_CUDA_KERNEL
         else:
             self.USE_CUDA_KERNEL = False
+        # No CUDA Kernel necessary for depthwise convolution
+        if USE_DEPTHWISE == True:
+            self.USE_CUDA_KERNEL = False
         self.norm_layer = norm_layer
         self.drop_out_rate = drop_out_rate
         self.drop_path_rate = drop_path_rate
@@ -53,17 +58,27 @@ class PointConv_Encoder(PointModule):
             weightnet_input_dim = point_dim + 9
         else:
             weightnet_input_dim = point_dim
+        # mid-dim is not useful if depthwise pointconv is used
         weightnet = [weightnet_input_dim, weightnet_middim[0]]  # 2 hidden layers
 
-
+        self.weightnet = []
         self.embedding_res_blocks = None
         if enc_depths[0] > 0:
+            if USE_DEPTHWISE == True:
+                self.weightnet.append(WeightNet(weightnet_input_dim, enc_channels[0], norm_layer = PointLayerNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+            else:
+                self.weightnet.append(WeightNet(weightnet_input_dim, weightnet_middim[0], norm_layer = PointLayerNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
             self.embedding_res_blocks = nn.ModuleList()
-            self.embedding = PointConvSimple(in_channels, enc_channels[0],weightnet, norm_layer, act_layer, USE_VI, USE_PE, USE_CUDA_KERNEL, drop_out_rate)
+            self.embedding = PointConvSimple(in_channels, enc_channels[0],self.weightnet[0], norm_layer, act_layer, USE_VI, USE_PE, USE_CUDA_KERNEL, drop_out_rate)
             for _ in range(enc_depths[0]-1):
-                self.embedding_res_blocks.append(
+                if USE_DEPTHWISE == True:
+                    self.embedding_res_blocks.append(
+                            DepthWisePointConv(
+                                enc_channels[0], enc_channels[0], USE_VI, self.weightnet[0], norm_layer, act_layer, K = enc_patch_size[0]))
+                else:
+                    self.embedding_res_blocks.append(
                             PointConvResBlock(
-                                enc_channels[0], enc_channels[0], USE_VI, self.USE_CUDA_KERNEL, weightnet, norm_layer, act_layer))
+                                enc_channels[0], enc_channels[0], USE_VI, self.USE_CUDA_KERNEL, self.weightnet[0], norm_layer, act_layer))
 
         else:
             self.embedding = PointLinearLayer(
@@ -79,19 +94,35 @@ class PointConv_Encoder(PointModule):
             in_ch = enc_channels[i - 1]
             out_ch = enc_channels[i]
             weightnet = [weightnet_input_dim, weightnet_middim[i]]
+            if USE_DEPTHWISE == True:
+            # Downsampling PointConv            
+                self.pointconv.append(
+                    DepthWisePointConv(
+                        in_ch, out_ch, USE_VI, self.weightnet[i-1],norm_layer, act_layer,drop_out_rate, drop_path_rate, K = enc_patch_size[i]))
+            else:
             # Downsampling PointConv
-            self.pointconv.append(
+                self.pointconv.append(
                     PointConvResBlock(
-                        in_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, weightnet,norm_layer, act_layer,drop_out_rate, drop_path_rate))
+                        in_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, self.weightnet[i-1],norm_layer, act_layer,drop_out_rate, drop_path_rate))
 
             if enc_depths[i] == 0:
                 self.pointconv_res.append(nn.ModuleList([]))
             else:
+                if USE_DEPTHWISE == True:
+                    self.weightnet.append(WeightNet(weightnet_input_dim, out_ch, norm_layer = PointLayerNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+                else:
+                    self.weightnet.append(WeightNet(weightnet_input_dim, weightnet_middim[i], norm_layer = PointLayerNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+
                 res_blocks = nn.ModuleList()
                 for _ in range(enc_depths[i]):
-                    res_blocks.append(
+                    if USE_DEPTHWISE == True:
+                        res_blocks.append(
+                           DepthWisePointConv(
+                        out_ch, out_ch, USE_VI, self.weightnet[i],norm_layer, act_layer, K = enc_patch_size[i]))
+                    else:
+                        res_blocks.append(
                             PointConvResBlock(
-                                out_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, weightnet, norm_layer, act_layer))
+                                out_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, self.weightnet[i], norm_layer, act_layer))
                 self.pointconv_res.append(res_blocks)
 
     def forward(self, point):
@@ -113,12 +144,20 @@ class PointConv_Encoder(PointModule):
         
          # Initial embedding, PointConv or MLP
         if self.embedding_res_blocks:
+            torch.cuda.synchronize()
+            start = time.time()
             with torch.no_grad():
                 if not hasattr(point,"neighbors") or len(point.neighbors)==0:
                     point.neighbors = compute_knn_batched(
                         point.coord, point.coord, point.offset, point.offset, K=self.enc_patch_size[0])
+                torch.cuda.synchronize()
+                end = time.time()
+                elapsed_time = end - start
+                elapsed_time_knn += elapsed_time
                 inv_self_args = {}
                 if self.USE_CUDA_KERNEL:
+                    torch.cuda.synchronize()
+                    start = time.time()
                     add_dim_neighbors = point.neighbors.unsqueeze(0)
                     inv_n, inv_k, inv_idx = pcf_cuda.compute_knn_inverse(add_dim_neighbors, point.coord.shape[0])
                     inv_self_args = {
@@ -126,12 +165,20 @@ class PointConv_Encoder(PointModule):
                                         "inv_k": inv_k,
                                         "inv_idx": inv_idx
                                     }
-            point.feat, vi_features = self.embedding(point.coord, point.feat, point.neighbors, point.normal, **inv_self_args)
+                    torch.cuda.synchronize()
+                    end = time.time()
+                    elapsed_time = end - start
+                    elapsed_time_inverse += elapsed_time
+            torch.cuda.synchronize()
+            start = time.time()
+            point.feat, vi_features = self.embedding(point, point.neighbors, **inv_self_args)
 
             for res_block in self.embedding_res_blocks:
-                point.feat, _ = res_block(
-                    point.coord, point.feat, point.neighbors, point.normal, vi_features=vi_features, **inv_self_args)
+                point.feat, _ = res_block(point, point.neighbors, vi_features = vi_features, **inv_self_args)
+#                    point.coord, point.feat, point.neighbors, point.normal, vi_features=vi_features, **inv_self_args)
         else:
+            torch.cuda.synchronize()
+            start = time.time()
             point.feat = self.embedding(point.feat)
 
         point_list = [point]
@@ -173,7 +220,8 @@ class PointConv_Encoder(PointModule):
                 torch.cuda.synchronize()
                 start = time.time()
                 down_point.feat, _ = pointconv(
-                    point.coord, point.feat, point.neighbors_down, point.normal, down_point.coord, down_point.normal, **inv_fwd_args)
+                    point, point.neighbors_down, down_point, **inv_fwd_args)
+#                    point.coord, point.feat, point.neighbors_down, point.normal, down_point.coord, down_point.normal, **inv_fwd_args)
                 torch.cuda.synchronize()
                 end = time.time()
                 elapsed_time = end - start
@@ -182,7 +230,8 @@ class PointConv_Encoder(PointModule):
                 torch.cuda.synchronize()
                 start = time.time()
                 down_point.feat, _ = pointconv(
-                    point.coord, point.feat, point.neighbors_down, point.normal, down_point.coord, down_point.normal)
+                    point, point.neighbors_down, down_point)
+#                    point.coord, point.feat, point.neighbors_down, point.normal, down_point.coord, down_point.normal)
                 torch.cuda.synchronize()
                 end = time.time()
                 elapsed_time = end - start
@@ -213,10 +262,12 @@ class PointConv_Encoder(PointModule):
                                     }
                 if vi_features is not None:
                     down_point.feat, _ = res_block(
-                        down_point.coord, down_point.feat, down_point.neighbors, down_point.normal, vi_features=vi_features, **inv_self_args)
+                        down_point, down_point.neighbors, vi_features=vi_features, **inv_self_args)
+#                        down_point.coord, down_point.feat, down_point.neighbors, down_point.normal, vi_features=vi_features, **inv_self_args)
                 else:
                     down_point.feat, vi_features = res_block(
-                        down_point.coord, down_point.feat, down_point.neighbors, down_point.normal, **inv_self_args)
+                        down_point, down_point.neighbors, vi_features=vi_features, **inv_self_args)
+#                        down_point.coord, down_point.feat, down_point.neighbors, down_point.normal, **inv_self_args)
             point_list.append(down_point)
             point = down_point
             torch.cuda.synchronize()
@@ -377,9 +428,11 @@ class PointConvUNet(PointModule):
                  USE_PE=True, 
                  USE_VI=True, 
                  USE_CUDA_KERNEL=True,
+                 USE_DEPTHWISE = True,
                  weightnet_middim = [4,4,4,4,4],
                  act_layer = torch.nn.LeakyReLU(0.1, inplace=True),
                  norm_layer=torch.nn.LayerNorm, 
+                 decoder_mlp_layers = True,
                  drop_out_rate=0.0, 
                  drop_path_rate=0.0):
         super(PointConvUNet, self).__init__()
@@ -389,6 +442,7 @@ class PointConvUNet(PointModule):
             enc_depths=enc_depths,
             enc_channels=enc_channels,
             enc_patch_size=enc_patch_size,
+            USE_DEPTHWISE = USE_DEPTHWISE,
             USE_PE=USE_PE,
             USE_VI=USE_VI,
             USE_CUDA_KERNEL=USE_CUDA_KERNEL,
@@ -406,6 +460,7 @@ class PointConvUNet(PointModule):
             USE_VI=USE_VI,
             USE_CUDA_KERNEL=USE_CUDA_KERNEL,
             weightnet_middim=weightnet_middim,
+            mlp_layers=decoder_mlp_layers,
             act_layer=act_layer,
             norm_layer=norm_layer,
             drop_out_rate=drop_out_rate,
