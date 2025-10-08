@@ -1,7 +1,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 28 # bs: total bs in all gpus
+batch_size = 20 # bs: total bs in all gpus
 num_worker = 16
 mix_prob = 0.8
 empty_cache = False
@@ -11,15 +11,15 @@ enable_amp = False
 model = dict(
     type="DefaultSegmentorV2",
     num_classes=20,
-    backbone_out_channels=32,
+    backbone_out_channels=64,
     backbone=dict(
         type="PointConvUNet",
         in_channels=6,
         enc_depths=(3,3,3,3,3),
-        enc_channels=(32,64,96,128,256),
+        enc_channels=(64,96,128,192,256),
         enc_patch_size=(32,32,32,32,32),
         dec_depths=(0,0,0,0,0),
-        dec_channels=(32,64,96,128, 256),
+        dec_channels=(64,96,128,192,256),
         dec_patch_size=(16,16,16,16,16),
         decoder_mlp_layers = True,
         USE_PE = True,
@@ -298,11 +298,11 @@ data = dict(
 
 # hook
 hooks = [
-#    dict(type="CheckpointLoader"),
+    dict(type="CheckpointLoader"),
     dict(type="ModelHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
     dict(type="SemSegEvaluator"),
-#    dict(type="CheckpointSaver", save_freq=5),
-#    dict(type="PreciseEvaluator", test_last=False),
+    dict(type="CheckpointSaver", save_freq=5),
+    dict(type="PreciseEvaluator", test_last=False),
 ]
