@@ -5,10 +5,10 @@ import torch
 import torch.utils.checkpoint as checkpoint
 import torch.nn.functional as F
 import torch.nn as nn
-from .pointconv_utils import PConvLinearOpt, index_points, VI_coordinate_transform, PointLayerNorm, PointInstanceNorm
+from .pointconv_utils import PConvLinearOpt, index_points, VI_coordinate_transform, PointLayerNorm, PointInstanceNorm, PointGroupNorm
 # Treatments to deal with batch normalization and gradient checkpointing for batch normalization
 # Can be removed if not using batch normalization
-from .pointconv_utils import CheckpointFunction,CpBatchNorm2d,Linear_BN,PermutedBN,_bn_function_factory
+from .pointconv_utils import CheckpointFunction,CpBatchNorm2d,Linear_BN,_bn_function_factory,PermutedBN
 
 
 class PointLinearLayer(nn.Module):
@@ -288,7 +288,7 @@ class DepthWisePointConv(nn.Module):
         else:
             offset = torch.cat([torch.tensor([0], dtype=dense_points.offset.dtype, device=dense_points.offset.device), dense_points.offset])
             batch_indices = dense_points.batch
-        if self.norm_layer == PointLayerNorm or self.norm_layer == PointInstanceNorm:
+        if self.norm_layer == PointLayerNorm or self.norm_layer == PointInstanceNorm or self.norm_layer == PointGroupNorm:
             feat_pe = self.pe_convs(localized_xyz, (offset,batch_indices))
         else:
             feat_pe = self.pe_convs(localized_xyz)  # [B, M, K, D]
@@ -311,7 +311,7 @@ class DepthWisePointConv(nn.Module):
             weightNetInput = localized_xyz
         # No CUDA kernel for this
         gathered_feat = index_points(dense_feats, nei_inds)  # [B, M, K, in_ch]
-        if self.weightnet.norm_layer == PointLayerNorm or self.weightnet.norm_layer == PointInstanceNorm:
+        if self.weightnet.norm_layer == PointLayerNorm or self.weightnet.norm_layer == PointInstanceNorm or self.weightnet.norm_layer == PointGroupNorm:
             weights = self.weightnet(weightNetInput, (offset,batch_indices))
         else:
             weights = self.weightnet(weightNetInput)
@@ -321,7 +321,7 @@ class DepthWisePointConv(nn.Module):
         new_feat = torch.cat([new_feat, feat_pe], dim=-1)
         # Sum out the neighborhood dimension
         new_feat = new_feat.sum(dim = 2)
-        if self.norm_layer == PointLayerNorm or self.norm_layer == PointInstanceNorm:
+        if self.norm_layer == PointLayerNorm or self.norm_layer == PointInstanceNorm or self.norm_layer == PointGroupNorm:
             new_feat = self.norm(new_feat,offset, batch_indices)
         else:
             new_feat = self.norm(new_feat)
@@ -512,7 +512,7 @@ class PointConvResBlock(nn.Module):
             offset = torch.cat([torch.tensor([0], dtype=dense_points.offset.dtype, device=dense_points.offset.device), dense_points.offset])
             batch_indices = dense_points.batch
 
-        if self.norm_layer == PointLayerNorm or self.norm_layer == PointInstanceNorm:
+        if self.norm_layer == PointLayerNorm or self.norm_layer == PointInstanceNorm or self.norm_layer == PointGroupNorm:
             feat_pe = self.pe_convs(localized_xyz, (offset,batch_indices))
         else:
             feat_pe = self.pe_convs(localized_xyz)  # [B, M, K, D]
@@ -540,7 +540,7 @@ class PointConvResBlock(nn.Module):
             gathered_feat = index_points(feats_x, nei_inds)  # [B, M, K, in_ch]
             new_feat = torch.cat([gathered_feat, feat_pe], dim=-1)
 
-        if self.weightnet.norm_layer == PointLayerNorm or self.weightnet.norm_layer == PointInstanceNorm:
+        if self.weightnet.norm_layer == PointLayerNorm or self.weightnet.norm_layer == PointInstanceNorm or self.weightnet.norm_layer == PointGroupNorm:
             weights = self.weightnet(weightNetInput, (offset,batch_indices))
         else:
             weights = self.weightnet(weightNetInput)
@@ -757,7 +757,7 @@ class PointConvSimple(nn.Module):
         else:
             additional_features = None
 
-        if self.weightnet.norm_layer == PointLayerNorm:
+        if self.weightnet.norm_layer == PointLayerNorm or self.weightnet.norm_layer == PointGroupNorm:
             offset = torch.cat([torch.tensor([0], dtype=dense_points.offset.dtype, device=dense_points.offset.device), dense_points.offset])
             batch_indices = dense_points.batch
             weights = self.weightnet(weightNetInput, (offset, batch_indices))

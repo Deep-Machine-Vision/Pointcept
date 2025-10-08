@@ -50,7 +50,6 @@ class PConvLinearOptFunction(torch.autograd.Function):
         output, pconv_output = pcf_cuda.pconv_linear_cutlass_forward(
             input_feat, neighbor_inds, weightnet, additional_features, 
             linear_weights_new_type, linear_bias_new_type)
-
         ctx.save_for_backward(input_feat, inverse_neighbors, inverse_k, inverse_idx, 
                             neighbor_inds, weightnet, additional_features, 
                             linear_weights_new_type, linear_bias, pconv_output)
@@ -396,6 +395,123 @@ class PointLayerNorm(torch.nn.Module):
                 return normalized_x / std_x + self.bias_val
             else:
                 return normalized_x / std_x
+
+class PointGroupNorm(torch.nn.Module):
+    """
+    Group Normalization for packed point-cloud tensors WITH per-batch aggregation
+    across points and middle dims.
+
+    Input/Shapes:
+        x: [B, N, *M, C]    (C is last; *M can be empty or multiple dims)
+        batch_offsets: CSR pointer for the N dimension; shape [B+1] (or [1, B+1] broadcastable)
+        batch_indices: Long tensor of shape [N] mapping each point to its batch (0..B-1)
+
+    Stats:
+        For each batch b and group g, mean/var are computed over (N, *M, Cg).
+
+    Args:
+        channels (int): total channels C
+        num_groups (int): number of groups G (C must be divisible by G)
+        eps (float): numerical stability
+        elementwise_affine (bool): learnable per-channel gamma/beta
+        bias (bool): include beta if True
+
+    Returns:
+        Tensor with the same shape as x, normalized per (batch, group).
+    """
+    def __init__(self, channels, num_groups = 4, eps=1e-5,
+                 elementwise_affine=True, bias=True):
+        super().__init__()
+        assert channels % num_groups == 0, "channels must be divisible by num_groups"
+        self.channels = channels
+        self.num_groups = num_groups
+        self.group_size = channels // num_groups
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        self.use_bias = bias
+
+        if elementwise_affine:
+            self.weight = torch.nn.Parameter(torch.ones(channels))
+            self.bias_val = torch.nn.Parameter(torch.zeros(channels) if bias else torch.empty(0))
+            if not bias:
+                self.register_parameter('bias_val', None)
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias_val', None)
+
+    def forward(self, x, batch_offsets, batch_indices):
+        from torch_scatter import segment_csr
+
+        assert x.size(-1) == self.channels, \
+            f"Expected last dim C={self.channels}, got {x.size(-1)}"
+
+        # Make batch_offsets broadcastable like in your PointLayerNorm
+        if batch_offsets.dim() == 1 and x.dim() > 2:
+            batch_offsets = batch_offsets.unsqueeze(0)  # [1, B+1]
+
+        B, N = x.shape[0], x.shape[1]
+        G, Cg = self.num_groups, self.group_size
+
+        # Reshape channels into groups: [B, N, *M, G, Cg]
+        xg = x.view(*x.shape[:-1], G, Cg)
+
+        # Prepare the dims that represent *M (middle dims)
+        num_middle = x.dim() - 3  # dims between N and C
+        # In xg, middle dims are at positions: 2 .. (1 + num_middle)
+        if num_middle > 0:
+            middle_reduce_dims = tuple(range(2, 2 + num_middle))  # reduce over all *M
+        else:
+            middle_reduce_dims = ()
+
+        # ---------- Mean over (N, *M, Cg) per (batch, group) ----------
+        # First reduce within each point/middle over (Cg and *M) -> [B, N, G]
+        if num_middle > 0:
+            mean_point_group = xg.mean(dim=(-1,) + middle_reduce_dims)  # reduce Cg and *M
+        else:
+            mean_point_group = xg.mean(dim=-1)  # only reduce Cg
+
+        # Then average across points within each batch using CSR -> [B, G]
+        mean_batch_group = segment_csr(mean_point_group, batch_offsets, reduce='mean')
+
+        # Map per-(batch,group) means back to all points, then broadcast over *M and Cg
+        # Start: [B, G] -> insert N via batch_indices -> [B, N, G]
+        mean_bg_pts = mean_batch_group[:, batch_indices, :]  # [B, N, G]
+        # Expand to [B, N, *M, G, Cg]
+        if num_middle > 0:
+            # add *M dims as singleton, then expand to xg shape
+            expand_shape = list(xg.shape)
+            mean_bg_pts = mean_bg_pts.view(B, N, *([1] * num_middle), G)
+        mean_bg_pts = mean_bg_pts.unsqueeze(-1)  # add Cg dim -> [B, N, *M, G, 1]
+        mean_bg_pts = mean_bg_pts.expand_as(xg)
+
+        # ---------- Variance over (N, *M, Cg) per (batch, group) ----------
+        dev = xg - mean_bg_pts  # [B, N, *M, G, Cg]
+        if num_middle > 0:
+            var_point_group = (dev * dev).mean(dim=(-1,) + middle_reduce_dims)  # [B, N, G]
+        else:
+            var_point_group = (dev * dev).mean(dim=-1)  # [B, N, G]
+
+        var_batch_group = segment_csr(var_point_group, batch_offsets, reduce='mean')  # [B, G]
+        std_group = torch.sqrt(var_batch_group + self.eps)
+        std_bg_pts = std_group[:, batch_indices, :]  # [B, N, G]
+        if num_middle > 0:
+            std_bg_pts = std_bg_pts.view(B, N, *([1] * num_middle), G)
+        std_bg_pts = std_bg_pts.unsqueeze(-1).expand_as(xg)  # [B, N, *M, G, Cg]
+
+        # ---------- Normalize and reshape back ----------
+        xg_norm = (xg - mean_bg_pts) / std_bg_pts  # [B, N, *M, G, Cg]
+        x_norm = xg_norm.view(*x.shape)  # back to [B, N, *M, C]
+
+        # ---------- Affine ----------
+        if self.elementwise_affine:
+            w = self.weight
+            if self.use_bias and self.bias_val is not None:
+                b = self.bias_val
+                return x_norm * w + b
+            else:
+                return x_norm * w
+        else:
+            return x_norm
             
 class BatchLayerNorm(torch.nn.Module):
     def __init__(self, channels, eps=1e-5, elementwise_affine=True, bias = True):

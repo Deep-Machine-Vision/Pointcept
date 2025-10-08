@@ -1,8 +1,8 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 27 # bs: total bs in all gpus
-num_worker = 20
+batch_size = 28 # bs: total bs in all gpus
+num_worker = 16
 mix_prob = 0.8
 empty_cache = False
 enable_amp = False
@@ -16,15 +16,15 @@ model = dict(
         type="PointConvUNet",
         in_channels=6,
         enc_depths=(3,3,3,3,3),
-        enc_channels=(32, 64, 128, 256, 512),
-        enc_patch_size=(16,16,16,16,16),
+        enc_channels=(32,64,96,128,256),
+        enc_patch_size=(32,32,32,32,32),
         dec_depths=(0,0,0,0,0),
-        dec_channels=(32,64,128,256,512),
+        dec_channels=(32,64,96,128, 256),
         dec_patch_size=(16,16,16,16,16),
         decoder_mlp_layers = True,
         USE_PE = True,
         USE_VI = True,
-        USE_DEPTHWISE = False,
+        USE_DEPTHWISE = True,
         USE_CUDA_KERNEL = False,
         weightnet_middim = [4,4,4,4,4],
         drop_out_rate = 0.0,
@@ -298,11 +298,11 @@ data = dict(
 
 # hook
 hooks = [
-    dict(type="CheckpointLoader"),
+#    dict(type="CheckpointLoader"),
     dict(type="ModelHook"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
     dict(type="SemSegEvaluator"),
-    dict(type="CheckpointSaver", save_freq=5),
-    dict(type="PreciseEvaluator", test_last=False),
+#    dict(type="CheckpointSaver", save_freq=5),
+#    dict(type="PreciseEvaluator", test_last=False),
 ]

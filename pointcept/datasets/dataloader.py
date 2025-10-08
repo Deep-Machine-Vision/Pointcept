@@ -7,6 +7,7 @@ import pointcept.utils.comm as comm
 from pointcept.datasets.utils import point_collate_fn
 from pointcept.datasets import ConcatDataset
 from pointcept.utils.env import set_seed
+from .utils import _RepeatSampler
 
 
 class MultiDatasetDummySampler:
@@ -110,3 +111,19 @@ class MultiDatasetDataloader:
             + seed
         )
         set_seed(worker_seed)
+
+class MultiEpochsDataLoader(torch.utils.data.DataLoader):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._DataLoader__initialized = False
+        self.batch_sampler = _RepeatSampler(self.batch_sampler)
+        self._DataLoader__initialized = True
+        self.iterator = super().__iter__()
+
+    def __len__(self):
+        return len(self.batch_sampler.sampler)
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield next(self.iterator)

@@ -4,7 +4,7 @@ from pointcept.models.utils.knn import compute_knn_batched
 from pointcept.models.utils.sampling import grid_sampling
 from pointcept.models.modules import PointModule
 from .pointconv import PointLinearLayer, PointConvResBlock, PointConvTranspose, PointConvSimple, DepthWisePointConv, WeightNet
-from .pointconv_utils import PointLayerNorm
+from .pointconv_utils import PointGroupNorm, PointLayerNorm
 import torch.nn as nn
 import torch
 
@@ -65,20 +65,25 @@ class PointConv_Encoder(PointModule):
         self.embedding_res_blocks = None
         if enc_depths[0] > 0:
             if USE_DEPTHWISE == True:
-                self.weightnet.append(WeightNet(weightnet_input_dim, enc_channels[0], norm_layer = PointLayerNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+                self.weightnet.append(WeightNet(weightnet_input_dim, enc_channels[0], norm_layer = PointGroupNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
             else:
-                self.weightnet.append(WeightNet(weightnet_input_dim, weightnet_middim[0], norm_layer = PointLayerNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+                self.weightnet.append(WeightNet(weightnet_input_dim, weightnet_middim[0], norm_layer = PointGroupNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
             self.embedding_res_blocks = nn.ModuleList()
             self.embedding = PointConvSimple(in_channels, enc_channels[0],self.weightnet[0], norm_layer, act_layer, USE_VI, USE_PE, USE_CUDA_KERNEL, drop_out_rate)
             for _ in range(enc_depths[0]-1):
                 if USE_DEPTHWISE == True:
+                    self.weightnet.append(WeightNet(weightnet_input_dim, enc_channels[0], norm_layer = PointGroupNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+                else:
+                    self.weightnet.append(WeightNet(weightnet_input_dim, weightnet_middim[0], norm_layer = PointGroupNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+
+                if USE_DEPTHWISE == True:
                     self.embedding_res_blocks.append(
                             DepthWisePointConv(
-                                enc_channels[0], enc_channels[0], USE_VI, self.weightnet[0], norm_layer, act_layer, K = enc_patch_size[0]))
+                                enc_channels[0], enc_channels[0], USE_VI, self.weightnet[-1], norm_layer, act_layer, K = enc_patch_size[0]))
                 else:
                     self.embedding_res_blocks.append(
                             PointConvResBlock(
-                                enc_channels[0], enc_channels[0], USE_VI, self.USE_CUDA_KERNEL, self.weightnet[0], norm_layer, act_layer))
+                                enc_channels[0], enc_channels[0], USE_VI, self.USE_CUDA_KERNEL, self.weightnet[-1], norm_layer, act_layer))
 
         else:
             self.embedding = PointLinearLayer(
@@ -95,34 +100,40 @@ class PointConv_Encoder(PointModule):
             out_ch = enc_channels[i]
             weightnet = [weightnet_input_dim, weightnet_middim[i]]
             if USE_DEPTHWISE == True:
+                self.weightnet.append(WeightNet(weightnet_input_dim, enc_channels[i-1], norm_layer = PointGroupNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+            else:
+                self.weightnet.append(WeightNet(weightnet_input_dim, weightnet_middim[i], norm_layer = PointGroupNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+
+            if USE_DEPTHWISE == True:
             # Downsampling PointConv            
                 self.pointconv.append(
                     DepthWisePointConv(
-                        in_ch, out_ch, USE_VI, self.weightnet[i-1],norm_layer, act_layer,drop_out_rate, drop_path_rate, K = enc_patch_size[i]))
+                        in_ch, out_ch, USE_VI, self.weightnet[-1],norm_layer, act_layer,drop_out_rate, drop_path_rate, K = enc_patch_size[i]))
             else:
             # Downsampling PointConv
                 self.pointconv.append(
                     PointConvResBlock(
-                        in_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, self.weightnet[i-1],norm_layer, act_layer,drop_out_rate, drop_path_rate))
+                        in_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, self.weightnet[-1],norm_layer, act_layer,drop_out_rate, drop_path_rate))
 
             if enc_depths[i] == 0:
                 self.pointconv_res.append(nn.ModuleList([]))
             else:
-                if USE_DEPTHWISE == True:
-                    self.weightnet.append(WeightNet(weightnet_input_dim, out_ch, norm_layer = PointLayerNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
-                else:
-                    self.weightnet.append(WeightNet(weightnet_input_dim, weightnet_middim[i], norm_layer = PointLayerNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
-
                 res_blocks = nn.ModuleList()
                 for _ in range(enc_depths[i]):
+
+                    if USE_DEPTHWISE == True:
+                        self.weightnet.append(WeightNet(weightnet_input_dim, out_ch, norm_layer = PointGroupNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+                    else:
+                        self.weightnet.append(WeightNet(weightnet_input_dim, weightnet_middim[i], norm_layer = PointGroupNorm, act_layer = act_layer, efficient=True, K = enc_patch_size[0]))
+
                     if USE_DEPTHWISE == True:
                         res_blocks.append(
                            DepthWisePointConv(
-                        out_ch, out_ch, USE_VI, self.weightnet[i],norm_layer, act_layer, K = enc_patch_size[i]))
+                        out_ch, out_ch, USE_VI, self.weightnet[-1],norm_layer, act_layer, K = enc_patch_size[i]))
                     else:
                         res_blocks.append(
                             PointConvResBlock(
-                                out_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, self.weightnet[i], norm_layer, act_layer))
+                                out_ch, out_ch, USE_VI, self.USE_CUDA_KERNEL, self.weightnet[-1], norm_layer, act_layer))
                 self.pointconv_res.append(res_blocks)
 
     def forward(self, point):
