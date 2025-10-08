@@ -109,7 +109,7 @@ class PointConv_Encoder(PointModule):
                     if USE_DEPTHWISE == True:
                         res_blocks.append(
                             DepthWisePointConv(
-                                enc_channels[0], enc_channels[0], USE_VI, self.weightnet[-1], norm_layer, act_layer))
+                                out_ch, out_ch, USE_VI, self.weightnet[-1], norm_layer, act_layer))
                     else:
                         res_blocks.append(
                             PointConvResBlock(
