@@ -187,7 +187,7 @@ class DepthWisePointConv(nn.Module):
         
         # Shortcut optional mlp
         if in_channel != out_channel:
-            self.unary_shortcut = PointLinearLayer(in_channel,out_channel,norm_layer = norm_layer, act_layer = None, bn_ver = '1d')
+            self.unary_shortcut = PointLinearLayer(in_channel,out_channel,norm_layer = None, act_layer = None, bn_ver = '1d')
         else:
             self.unary_shortcut = nn.Identity()
 
@@ -345,7 +345,15 @@ class PointConvResBlock(nn.Module):
         self.act_layer = act_layer
         self.norm_layer = norm_layer
 
-        # positonal encoder
+        if in_channel != out_channel // 4:
+            self.unary1 = PointLinearLayer(
+                in_channel,
+                out_channel // 4,
+                norm_layer = norm_layer, bn_ver = '1d')
+        else:
+            self.unary1 = nn.Identity()
+
+        # positional encoder
         self.pe_convs = WeightNet(
             3, min(out_channel // 4, 32), hidden_unit=[out_channel // 4], norm_layer = norm_layer, act_layer = act_layer, efficient=True)
         last_ch = min(out_channel // 4, 32)

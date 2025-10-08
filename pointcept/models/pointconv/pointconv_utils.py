@@ -2,6 +2,7 @@ import torch
 from torch.nn import functional as F
 import pcf_cuda
 import warnings
+from pointcept.models.utils import offset2batch
 
 
 # CheckpointFunction class taken from https://github.com/csrhddlam/pytorch-checkpoint/blob/master/checkpoint.py
@@ -49,7 +50,6 @@ class PConvLinearOptFunction(torch.autograd.Function):
         output, pconv_output = pcf_cuda.pconv_linear_cutlass_forward(
             input_feat, neighbor_inds, weightnet, additional_features, 
             linear_weights_new_type, linear_bias_new_type)
-
         ctx.save_for_backward(input_feat, inverse_neighbors, inverse_k, inverse_idx, 
                             neighbor_inds, weightnet, additional_features, 
                             linear_weights_new_type, linear_bias, pconv_output)
@@ -144,6 +144,8 @@ class CpBatchNorm2d(torch.nn.BatchNorm2d):
                 input, self.running_mean, self.running_var, self.weight, self.bias,
                 self.training or not self.track_running_stats, 0.0, self.eps)
 
+'''
+Old version:
 def index_points(points, idx):
     """
     Input:
@@ -161,6 +163,34 @@ def index_points(points, idx):
     batch_indices = torch.arange(B, dtype=torch.long).to(
         device).view(view_shape).repeat(repeat_shape)
     new_points = points[batch_indices, idx, :]
+    return new_points
+'''
+
+def index_points(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """
+    Index point features for both batched and single-batch inputs.
+    Args:
+        points: Tensor of shape (B, N, C) or (N, C)
+        idx: Tensor of shape (B, S), (B, S, K), (S,), or (S, K)
+    Returns:
+        new_points: Tensor of shape (B, S, C), (S, C) or (B, S, K, C)
+    """
+    if points.dim() == 3:
+        B, N, C = points.shape
+    if (points.dim() == 2) or (B == 1):
+        if points.dim() == 2:
+            return points[idx,:]
+        # No batch index needed; direct indexing
+        new_points = points[:, idx.squeeze(0), :]
+        # Preserve any extra dims in idx
+        return new_points.view(1, *idx.shape[1:], C)
+    # Batched indexing path
+    device = points.device
+    batch_shape = list(idx.shape)
+    batch_shape[1:] = [1] * (len(batch_shape) - 1)
+    batch_indices = torch.arange(B, device=device).view(batch_shape).expand_as(idx)
+    new_points = points[batch_indices, idx, :]
+
     return new_points
 
 def VI_coordinate_transform(localized_xyz, gathered_norm, sparse_xyz_norm, K):
@@ -311,36 +341,3 @@ def replace_bn_layers(module: torch.nn.Module, verbose: bool = True):
             raise RuntimeError(f"Failed to fuse {module}: {e}") from e
 
     return module, fused_count
-
-class PointLayerNorm:
-    def __init__(self, channels, eps=1e-5, elementwise_affine=True, bias = True):
-        """
-        Applies Layer Normalization for packed representation of point clouds
-        as described in the paper Layer Normalization (https://arxiv.org/abs/1607.06450)
-        Input:
-            x: input points data, shape [B, N, C]
-        Return:
-            normalized points data, shape [B, N, C]
-        """
-        self.eps = eps
-        self.channels = channels
-        self.elementwise_affine = elementwise_affine
-        self.bias = bias
-        if elementwise_affine:
-            self.weight = torch.nn.Parameter(torch.ones(channels))
-        if bias:
-            self.bias = torch.nn.Parameter(torch.zeros(channels))
-    def forward(self, x, batch_indices):
-        from torch_scatter import segment_csr
-        mean_x = segment_csr(x, batch_indices, reduce='mean')
-        std_x = torch.sqrt(segment_csr((x - mean_x[batch_indices])**2, batch_indices, reduce='mean') + self.eps)
-        if self.elementwise_affine:
-            if self.bias:
-                return (x - mean_x[batch_indices]) / std_x[batch_indices] * self.weight + self.bias
-            else:
-                return (x - mean_x[batch_indices]) / std_x[batch_indices] * self.weight
-        else:
-            if self.bias:
-                return (x - mean_x[batch_indices]) / std_x[batch_indices] + self.bias
-            else:
-                return (x - mean_x[batch_indices]) / std_x[batch_indices]

@@ -1,8 +1,8 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 32 # bs: total bs in all gpus
-num_worker = 20
+batch_size = 20 # bs: total bs in all gpus
+num_worker = 16
 mix_prob = 0.8
 empty_cache = False
 enable_amp = False
@@ -11,19 +11,20 @@ enable_amp = False
 model = dict(
     type="DefaultSegmentorV2",
     num_classes=20,
-    backbone_out_channels=32,
+    backbone_out_channels=64,
     backbone=dict(
         type="PointConvUNet",
         in_channels=6,
         enc_depths=(3,3,3,3,3),
-        enc_channels=(32, 64, 128, 256, 512),
-        enc_patch_size=(16,16,16,16,16),
+        enc_channels=(64,96,128,192,256),
+        enc_patch_size=(32,32,32,32,32),
         dec_depths=(0,0,0,0,0),
-        dec_channels=(32,64,128,256,512),
+        dec_channels=(64,96,128,192,256),
         dec_patch_size=(16,16,16,16,16),
-        norm_layer = 'bn',
+        decoder_mlp_layers = True,
         USE_PE = True,
         USE_VI = True,
+        USE_DEPTHWISE = True,
         USE_CUDA_KERNEL = False,
         weightnet_middim = [4,4,4,4,4],
         drop_out_rate = 0.0,
@@ -36,13 +37,13 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 300
-eval_epoch = 300
-optimizer = dict(type="AdamW", lr=0.01, weight_decay=0.0)
+epoch = 450
+eval_epoch = 450
+optimizer = dict(type="AdamW", lr=0.01, weight_decay=0.00001)
 scheduler = dict(
-    type="MultiStepLR",
+    type="MultiStepWithWarmupLR",
     # milestones need to be w.r.t. the full training length
-    milestones = [0.25,0.45,0.6,0.75, 0.9],
+    milestones = [0.35,0.55,0.7,0.8, 0.9],
     gamma = 0.5,
 )
 

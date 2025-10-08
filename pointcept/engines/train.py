@@ -25,7 +25,7 @@ from tensorboardX import SummaryWriter
 from .defaults import create_ddp_model, worker_init_fn
 from .hooks import HookBase, build_hooks
 import pointcept.utils.comm as comm
-from pointcept.datasets import build_dataset, point_collate_fn, collate_fn
+from pointcept.datasets import build_dataset, point_collate_fn, collate_fn, MultiEpochsDataLoader
 from pointcept.models import build_model
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.optimizer import build_optimizer
@@ -280,7 +280,7 @@ class Trainer(TrainerBase):
             else None
         )
 
-        train_loader = torch.utils.data.DataLoader(
+        train_loader = MultiEpochsDataLoader(
             train_data,
             batch_size=self.cfg.batch_size_per_gpu,
             shuffle=(train_sampler is None),
